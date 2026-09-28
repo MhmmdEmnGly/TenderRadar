@@ -1,0 +1,31 @@
+name: Kamu İhale Bülteni
+
+# KİK'in herkese açık günlük bültenlerinden ihale sonuç ilanlarını toplar.
+on:
+  workflow_dispatch:
+    inputs:
+      mod:
+        description: "probe = yapıyı incele"
+        required: false
+        default: "probe"
+  push:
+    branches: [main]
+    paths:
+      - "scraper/bulten.py"
+      - ".github/workflows/bulten.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bulten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pypdf requests
+      - name: Bülten
+        run: python scraper/bulten.py --probe

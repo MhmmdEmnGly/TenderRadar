@@ -13,9 +13,20 @@ Kullanım:
   python bulten.py --probe                 # yapıyı incele (test)
   python bulten.py --days 3 --out out.json # son 3 günün bültenlerini ayrıştır
 """
-import argparse, io, json, re, sys, time, zipfile, datetime as dt
+import argparse, io, json, re, ssl, sys, time, zipfile, datetime as dt
 import requests
+from requests.adapters import HTTPAdapter
 from pypdf import PdfReader
+
+
+class LegacyTLS(HTTPAdapter):
+    """EKAP'ın eski sunucusu yalnızca eski şifreleme takımlarını kabul ediyor (SECLEVEL=1).
+    Sertifika doğrulaması AÇIK kalır; yalnızca şifre takımı alt sınırı düşürülür."""
+    def init_poolmanager(self, *a, **kw):
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+        kw["ssl_context"] = ctx
+        return super().init_poolmanager(*a, **kw)
 
 URL = "https://ekap.kik.gov.tr/ekap/ilan/bultenindirme.aspx"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 TenderRadar/1.0"
@@ -42,6 +53,7 @@ def form_fields(html):
 def download(kind, day, today):
     """Bir bülteni indirir; PDF baytlarını döndürür (yoksa None)."""
     s = requests.Session()
+    s.mount("https://ekap.kik.gov.tr", LegacyTLS())
     s.headers.update({"User-Agent": UA})
     html = s.get(URL, timeout=60).text
     f = form_fields(html)

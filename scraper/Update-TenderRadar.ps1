@@ -736,6 +736,11 @@ if ($Cloud) {
     Invoke-Supabase POST 'app_settings?on_conflict=key' $kwRow @{ Prefer = 'resolution=merge-duplicates,return=minimal' } | Out-Null
   }
   Log 'Supabase: veri setleri yüklendi'
+  # GitHub Actions özetine (girişsiz görülebilen "notice") kaynak durumlarını yaz: sorun olursa hemen fark edilsin
+  $active = @($tenders | Where-Object { -not $_.isCancelled -and [DateTimeOffset]::Parse($_.tenderDate) -ge $Now }).Count
+  $srcLine = ($catalog | Where-Object { $_.status -ne 'planned' } | ForEach-Object { "$($_.id)=$($_.status)($($_.count))" }) -join ', '
+  Write-Host "::notice title=Tarama özeti::$active aktif ihale, $(@($tenders).Count) ihale (geçmiş dahil), $(@($news).Count) haber, $(@($deals).Count) sözleşme | $srcLine"
+  foreach ($c in $catalog | Where-Object { $_.status -eq 'err' }) { Write-Host "::warning title=Kaynak hatası: $($c.id)::$($c.message)" }
 }
 
 Log ("Bitti: {0} ihale, {1} haber, {2} sözleşme · aranan kelime: {3}" -f $tenders.Count, $news.Count, $deals.Count, $SearchTerms.Count)

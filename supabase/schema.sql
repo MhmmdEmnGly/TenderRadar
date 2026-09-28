@@ -42,5 +42,5 @@ drop policy if exists "app_settings okuma" on public.app_settings;
 drop policy if exists "app_settings ekleme" on public.app_settings;
 drop policy if exists "app_settings guncelleme" on public.app_settings;
 create policy "app_settings okuma"      on public.app_settings for select to authenticated using (true);
-create policy "app_settings ekleme"     on public.app_settings for insert to authenticated with check (key in ('keywords', 'scan_request'));
-create policy "app_settings guncelleme" on public.app_settings for update to authenticated using (key in ('keywords', 'scan_request')) with check (key in ('keywords', 'scan_request'));
+create policy "app_settings ekleme"     on public.app_settings for insert to authenticated with check (key in ('keywords', 'scan_request', 'history_import'));
+create policy "app_settings guncelleme" on public.app_settings for update to authenticated using (key in ('keywords', 'scan_request', 'history_import')) with check (key in ('keywords', 'scan_request', 'history_import'));

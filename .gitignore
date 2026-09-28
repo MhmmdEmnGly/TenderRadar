@@ -5,3 +5,5 @@ scraper/store/
 scraper/logs/
 reports/
 *.tmp
+# EKAP deneme toplayıcısı: kullanıcı kararı bekleniyor, repoya girmez
+scraper/Update-Ekap.ps1

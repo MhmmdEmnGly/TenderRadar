@@ -12,7 +12,7 @@
   // ---------- Kalıcı durum ----------
   // Bulut modunda müşteri kartları ve takip listesi Supabase'e yazılır (tüm cihazlarda aynı);
   // tema, filtre gibi cihaz tercihleri bu tarayıcıda kalır.
-  const CLOUD_KEYS = { crm: true, watch: true };
+  const CLOUD_KEYS = { crm: true, watch: true, prefs: true };
   const store = {
     get(key, fallback) {
       if (CLOUD && CLOUD_KEYS[key]) { const v = CLOUD.state[key]; return v == null ? fallback : v; }
@@ -65,6 +65,8 @@
     piyasaTab: "haber",
     param: null,
     custFilter: store.get("custFilter", { seg: "", pinned: false, sort: "active" }),
+    instFilter: store.get("instFilter", { il: "", seg: "", top: 7 }),
+    mapFilter: store.get("mapFilter", { metric: "active", seg: "", sel: null }),
     showAddCustomer: false,
     dealSort: { key: "date", dir: -1 }
   };
@@ -296,7 +298,12 @@
       return map.get(key);
     };
     tenders.forEach((t) => add(t.authority, "ihale"));
-    deals.forEach((x) => { if (x.client && !map.has(customerKey(x.client))) add(x.client, "sozlesme"); });
+    // Sözleşme işvereni, ad farklı yazılmış olsa da mevcut bir kurumla eşleşiyorsa ayrı kart açılmaz
+    deals.forEach((x) => {
+      if (!x.client || map.has(customerKey(x.client))) return;
+      const same = [...map.values()].some((c) => clientMatches({ key: c.key }, x.client));
+      if (!same) add(x.client, "sozlesme");
+    });
     Object.entries(crm).forEach(([key, c]) => { if (c.manual && !map.has(key)) map.set(key, { key, name: c.name || key, origins: new Set(["manuel"]) }); });
     _customers = [...map.values()].map((c) => {
       const data = crm[c.key] || {};
@@ -535,20 +542,169 @@
     },
 
     rakipler() {
-      const rows = aggregateWinners();
+      const pinned = new Set(prefs().rivals || []);
+      const rows = aggregateWinners()
+        .filter((r) => !state.q || matchesQuery({ n: r.name, c: [...r.clients].join(" "), s: [...r.sectors].join(" ") }, ["n", "c", "s"]))
+        .sort((a, b) => (pinned.has(b.name) ? 1 : 0) - (pinned.has(a.name) ? 1 : 0));
+      const top = rows.filter((r) => r.tryTotal).slice(0, 10);
       return `
-        <div class="page-head"><div><h1>Rakip Analizi</h1><p>Sözleşme ve ihale sonuçlarından otomatik çıkarılır: kim, hangi sektörde, hangi işverenle çalışıyor?</p></div></div>
+        <div class="page-head"><div><h1>Rakip Analizi</h1><p>Sözleşme ve ihale sonuçlarından otomatik çıkarılır: kim, hangi sektörde, hangi işverenle, kaça çalışıyor? Firmaya tıklayınca profili açılır.</p></div></div>
+        <div class="grid two-col" style="margin-bottom:16px">
+          <div class="card card-pad"><h3>En çok sözleşme bedeli alan firmalar (₺)</h3>
+            ${barList(top.map((r) => [r.name, r.tryTotal, `${r.name}: ${fmtMoney({ amount: r.tryTotal, currency: "TRY" })} · ${r.count} iş`, `#/rakip/${encodeURIComponent(r.name)}`]), (v) => fmtMoney({ amount: v, currency: "TRY" }))}
+          </div>
+          <div class="card card-pad"><h3>Özet</h3>
+            ${statTiles([["Firma", fmtNum(rows.length)], ["Sözleşme", fmtNum(deals.length)],
+              ["Toplam (₺)", esc(fmtMoney({ amount: deals.reduce((a, x) => a + tryAmount(x), 0), currency: "TRY" }))],
+              ["Ort. kırım", (() => { const d = deals.map(discountOf).filter((v) => v != null); return d.length ? "%" + fmtNum(d.reduce((a, b) => a + b, 0) / d.length, 1) : "—"; })()]])}
+            <p class="muted small" style="margin:10px 0 0">${dataNote}</p>
+          </div>
+        </div>
         <div class="card table-wrap">
           <table>
-            <thead><tr><th>Firma</th><th>İş sayısı</th><th>Toplam bedel</th><th>Sektörler</th><th>İşverenler</th><th>Son iş</th></tr></thead>
+            <thead><tr><th></th><th>Firma</th><th>İş</th><th>Toplam bedel</th><th>Ort. kırım</th><th>Ort. teklif</th><th>Sektörler</th><th>İşverenler</th><th>Son iş</th></tr></thead>
             <tbody>${rows.map((r) => `
-              <tr><td><b>${esc(r.name)}</b></td><td class="num">${r.count}</td>
-              <td class="num">${Object.entries(r.totals).map(([c, a]) => esc(fmtMoney({ amount: a, currency: c }))).join("<br>")}</td>
+              <tr><td>${pinned.has(r.name) ? "📌" : ""}</td><td><a href="#/rakip/${encodeURIComponent(r.name)}"><b>${hl(r.name)}</b></a></td><td class="num">${r.count}</td>
+              <td class="num">${Object.entries(r.totals).map(([c, a]) => esc(fmtMoney({ amount: a, currency: c }))).join("<br>") || "—"}</td>
+              <td class="num">${r.avgDiscount == null ? "—" : "%" + fmtNum(r.avgDiscount, 1)}</td>
+              <td class="num">${r.avgBidders == null ? "—" : fmtNum(r.avgBidders, 1)}</td>
               <td>${[...r.sectors].map((s) => `<span class="tag">${esc(s)}</span>`).join(" ")}</td>
-              <td class="small">${[...r.clients].map(esc).join("<br>")}</td>
-              <td>${esc(relDate(r.last))}</td></tr>`).join("")}</tbody>
+              <td class="small">${[...r.clients].map(esc).join("<br>") || "—"}</td>
+              <td>${esc(relDate(r.last))}</td></tr>`).join("") || `<tr><td colspan="9" class="muted">Henüz sözleşme verisi yok.</td></tr>`}</tbody>
           </table>
         </div>`;
+    },
+
+    rakip() {
+      const r = aggregateWinners().find((x) => x.name === state.param);
+      if (!r) return `<p>Firma bulunamadı. <a href="#/rakipler">Rakip listesine dön</a></p>`;
+      const pinned = (prefs().rivals || []).includes(r.name);
+      const words = customerKey(r.name).split(" ").filter((w) => w.length >= 3 && !/^(İNŞAAT|SANAYİ|TİCARET|ANONİM|ŞİRKETİ|LİMİTED|ORTAKLIĞI|MÜHENDİSLİK|VE|İŞ)$/.test(w)).slice(0, 2);
+      const mentions = words.length ? news.filter((n) => { const h = customerKey(`${n.title} ${n.summary || ""}`); return words.every((w) => h.includes(w)); }) : [];
+      const byClient = sumBy(r.deals, (x) => x.client || "Belirtilmemiş", tryAmount);
+      const bySector = countBy(r.deals, (x) => x.sector);
+      const list = r.deals.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+      return `
+        <div class="page-head">
+          <div><a class="small" href="#/rakipler">← Rakip analizi</a><h1 style="margin-top:6px">${esc(r.name)}</h1>
+            <p>${[...r.sectors].map((s) => `<span class="tag">${esc(s)}</span>`).join(" ")} · Son iş: ${esc(relDate(r.last))}</p></div>
+          <button class="btn ${pinned ? "on" : ""}" data-action="pin-rival" data-name="${esc(r.name)}" type="button">${pinned ? "📌 Takipte" : "📌 Rakibi takip et"}</button>
+        </div>
+        ${statTiles([["Sözleşme", fmtNum(r.count)], ["Toplam bedel", Object.entries(r.totals).map(([c, a]) => esc(fmtMoney({ amount: a, currency: c }))).join(" + ") || "—"],
+          ["Ort. kırım", r.avgDiscount == null ? "—" : "%" + fmtNum(r.avgDiscount, 1), "yaklaşık maliyete göre indirim"],
+          ["Ort. teklif sayısı", r.avgBidders == null ? "—" : fmtNum(r.avgBidders, 1), "ihalelerdeki rekabet"]])}
+        <div class="grid two-col" style="margin-top:16px">
+          <div class="card card-pad"><h3>İşverenlere göre sözleşme bedeli (₺)</h3>
+            ${barList(byClient.map(([c, v]) => [c, v, `${c}: ${fmtMoney({ amount: v, currency: "TRY" })}`, c !== "Belirtilmemiş" ? `#/musteri/${encodeURIComponent(customerKey(c))}` : ""]), (v) => fmtMoney({ amount: v, currency: "TRY" }))}</div>
+          <div class="card card-pad"><h3>Sektörlere göre iş sayısı</h3>${barList(bySector.map(([s, n]) => [s, n]), (v) => `${v} iş`)}</div>
+        </div>
+        <div class="card table-wrap" style="margin-top:16px">
+          <table><thead><tr><th>Tarih</th><th>İşveren</th><th>İş</th><th>Bedel</th><th>Yaklaşık maliyet</th><th>Kırım</th><th>Teklif</th><th>Kaynak</th></tr></thead>
+          <tbody>${list.map((x) => `<tr><td>${esc(fmtDate(x.date, false))}</td><td>${esc(x.client || "—")}</td><td>${esc(x.subject)}</td>
+            <td class="num">${esc(fmtMoney(x.amount))}</td><td class="num muted">${esc(fmtMoney(x.estimate))}</td>
+            <td class="num">${discountOf(x) == null ? "—" : "%" + fmtNum(discountOf(x), 1)}</td><td class="num">${x.bidders ?? "—"}</td>
+            <td class="small"><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.source)} ↗</a>${x.ekapUrl ? `<br><a href="${esc(x.ekapUrl)}" target="_blank" rel="noopener">EKAP ↗</a>` : ""}</td></tr>`).join("")}</tbody></table>
+        </div>
+        <div class="card card-pad" style="margin-top:16px"><h3>Adının geçtiği haberler <span class="muted small">${mentions.length}</span></h3>
+          ${mentions.slice(0, 20).map((n) => `<div class="list-item"><div><h4 style="font-weight:500"><a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4><div class="meta">${esc(n.source)} · ${esc(relDate(n.publishedAt))}</div></div></div>`).join("") || `<p class="muted small">Eşleşen haber yok.</p>`}
+          <p class="muted small">Takip ettiğin rakiplerin yeni haberleri Sabah Özeti'nde ayrıca listelenir.</p>
+        </div>`;
+    },
+
+    kurumlar() {
+      const f = state.instFilter;
+      const all = customers().filter((c) => c.tenders.length || c.deals.length);
+      const cities = [...new Set(all.map((c) => c.city).filter(Boolean))].sort((a, b) => a.localeCompare(b, "tr"));
+      const segs = [...new Set(all.map((c) => c.segment))];
+      const enrich = (c) => {
+        const dealsTry = c.deals.reduce((a, x) => a + tryAmount(x), 0);
+        const priced = c.deals.filter((x) => tryAmount(x));
+        return { ...c, n: c.tenders.length, dealsTry, avgDeal: priced.length ? dealsTry / priced.length : null,
+          lastTender: c.tenders.length ? c.tenders[c.tenders.length - 1].tenderDate : null };
+      };
+      // Potansiyel müşteri = alanımızda ihale açan kurum: önce ilgili ihale sayısı, sonra bilinen sözleşme bedeli
+      const rank = (a, b) => b.n - a.n || b.dealsTry - a.dealsTry || b.active.length - a.active.length;
+      const scoped = all.filter((c) => (!f.il || c.city === f.il) && (!f.seg || c.segment === f.seg)).map(enrich).sort(rank);
+      const withTenders = scoped.filter((c) => c.n > 0);
+      const top = (withTenders.length ? withTenders : scoped).slice(0, f.top || 7);
+      // İl bazında: her ilin en çok (bilinen) bütçeli / en çok ihale açan ilk 3 kurumu
+      const byCity = cities.map((il) => ({ il, list: all.filter((c) => c.city === il && (!f.seg || c.segment === f.seg)).map(enrich).sort(rank) }))
+        .filter((x) => x.list.length).sort((a, b) => b.list.reduce((s, c) => s + c.n, 0) - a.list.reduce((s, c) => s + c.n, 0));
+      // Kurum → yüklenici tablosu
+      const pairs = sumBy(deals.filter((x) => x.client), (x) => `${x.client}␟${x.winner}`, (x) => tryAmount(x) || 0.000001)
+        .map(([k, v]) => { const [client, winner] = k.split("␟"); const ds = deals.filter((x) => x.client === client && x.winner === winner); return { client, winner, total: Math.round(v), n: ds.length }; });
+      const months = lastMonths(12);
+
+      const card = (c, i) => {
+        // İlan ayı: yayın tarihi saklanmadığı için ihalenin radara ilk düştüğü tarih (yoksa ihale tarihi)
+        const monthly = months.map((m) => ({ key: m, label: monthLabel(m), value: c.tenders.filter((t) => monthKey(t.firstSeen || t.tenderDate) === m).length }));
+        const spendM = months.map((m) => ({ key: m, label: monthLabel(m), value: c.deals.filter((x) => monthKey(x.date) === m).reduce((a, x) => a + tryAmount(x), 0) }));
+        const years = sumBy(c.deals, (x) => String(new Date(x.date).getFullYear()), tryAmount);
+        const types = countBy(c.tenders, typeOf);
+        const topics = countBy(c.tenders.flatMap(topicOf), (x) => x);
+        const winners = sumBy(c.deals, (x) => x.winner, (x) => tryAmount(x) || 0.000001);
+        return `
+          <div class="card card-pad inst-card">
+            <div class="inst-head"><span class="rank">${i + 1}</span><div style="min-width:0"><h3 style="margin:0"><a href="#/musteri/${encodeURIComponent(c.key)}">${esc(c.displayName)}</a></h3>
+              <div class="muted small">${esc(c.segment)}${c.city ? " · " + esc(c.city) : ""}</div></div></div>
+            ${statTiles([["İhale", fmtNum(c.n), `${c.active.length} aktif`], ["Bilinen sözleşme", c.dealsTry ? esc(fmtMoney({ amount: c.dealsTry, currency: "TRY" })) : "—", c.deals.length ? `${c.deals.length} sözleşme${c.dealsTry ? "" : " (bedel açıklanmamış)"}` : "sözleşme haberi yok"],
+              ["Ort. sözleşme", c.avgDeal ? esc(fmtMoney({ amount: c.avgDeal, currency: "TRY" })) : "—"], ["Son ihale", c.lastTender ? esc(fmtDate(c.lastTender, false)) : "—"]])}
+            <div class="grid two-col" style="margin-top:12px">
+              <div><h4 class="chart-title">Aylık ihale sayısı (ilan ayı, son 12 ay)</h4>${columnChart(monthly, (v) => `${v} ihale`)}</div>
+              <div><h4 class="chart-title">Aylık bilinen harcama (₺, son 12 ay)</h4>${columnChart(spendM, (v) => fmtMoney({ amount: v, currency: "TRY" }))}</div>
+              <div><h4 class="chart-title">Alım türleri</h4>${barList(types.map(([k, v]) => [k, v]), (v) => `${v} ihale`)}</div>
+              <div><h4 class="chart-title">İlgilendiği konular</h4>${barList(topics.slice(0, 6).map(([k, v]) => [k, v]), (v) => `${v} ihale`)}</div>
+              <div><h4 class="chart-title">İşlerini alan firmalar</h4>${barList(winners.slice(0, 6).map(([k, v]) => [k, Math.round(v), `${k}: ${v >= 1 ? fmtMoney({ amount: v, currency: "TRY" }) : "bedel açıklanmamış"}`, `#/rakip/${encodeURIComponent(k)}`]), (v) => (v >= 1 ? fmtMoney({ amount: v, currency: "TRY" }) : "—"))}</div>
+              <div><h4 class="chart-title">Yıllara göre bilinen harcama</h4>${barList(years.map(([k, v]) => [k, v]), (v) => fmtMoney({ amount: v, currency: "TRY" }))}</div>
+            </div>
+          </div>`;
+      };
+
+      return `
+        <div class="page-head"><div><h1>Kurum Analitiği</h1><p>Potansiyel müşterilerin ihale hacmi, alım türleri, harcamaları ve işlerini alan firmalar.</p></div></div>
+        <div class="banner-note">ⓘ ${dataNote} EKAP sonuç verisi (tüm sözleşme bedelleri) bağlanana kadar harcama tutarları eksik kalır.</div>
+        <div class="filters">
+          <select data-inst="il"><option value="">Tüm iller</option>${cities.map((c) => `<option ${f.il === c ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>
+          <select data-inst="seg"><option value="">Tüm segmentler</option>${segs.map((s) => `<option ${f.seg === s ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>
+          <select data-inst="top">${[7, 10, 15, 20].map((n) => `<option value="${n}" ${(f.top || 7) === n ? "selected" : ""}>İlk ${n} kurum</option>`).join("")}</select>
+          <span class="muted small">${scoped.length} kurum</span>
+        </div>
+        <h2 class="section-title">İlk ${top.length} kurum${f.il ? " — " + esc(f.il) : ""}</h2>
+        <div class="inst-grid">${top.map(card).join("") || `<p class="muted">Bu filtrede kurum yok.</p>`}</div>
+
+        <h2 class="section-title">İl bazında en çok bütçeli / en aktif kurumlar</h2>
+        <div class="card table-wrap"><table>
+          <thead><tr><th>İl</th><th>Kurum</th><th>İhale</th><th>Aktif</th><th>Bilinen sözleşme (₺)</th><th>Ort. sözleşme</th><th>Alım türleri</th></tr></thead>
+          <tbody>${byCity.map(({ il, list }) => list.slice(0, 3).map((c, j) => `<tr>
+            ${j === 0 ? `<td rowspan="${Math.min(3, list.length)}"><b>${esc(il)}</b><div class="muted small">${list.length} kurum</div></td>` : ""}
+            <td><a href="#/musteri/${encodeURIComponent(c.key)}">${esc(c.displayName)}</a></td><td class="num">${c.n}</td><td class="num">${c.active.length}</td>
+            <td class="num">${c.dealsTry ? esc(fmtMoney({ amount: c.dealsTry, currency: "TRY" })) : "—"}</td><td class="num">${c.avgDeal ? esc(fmtMoney({ amount: c.avgDeal, currency: "TRY" })) : "—"}</td>
+            <td class="small">${countBy(c.tenders, typeOf).map(([k, v]) => `${esc(k)} (${v})`).join(", ")}</td></tr>`).join("")).join("") || `<tr><td colspan="7" class="muted">Veri yok.</td></tr>`}</tbody>
+        </table></div>
+
+        <h2 class="section-title">Kurumların ihalelerini alan firmalar</h2>
+        <div class="card table-wrap"><table>
+          <thead><tr><th>İşveren kurum</th><th>Yüklenici</th><th>İş sayısı</th><th>Toplam sözleşme</th></tr></thead>
+          <tbody>${pairs.map((p) => `<tr><td><a href="#/musteri/${encodeURIComponent(customerKey(p.client))}">${esc(p.client)}</a></td>
+            <td><a href="#/rakip/${encodeURIComponent(p.winner)}">${esc(p.winner)}</a></td><td class="num">${p.n}</td>
+            <td class="num">${p.total >= 1 ? esc(fmtMoney({ amount: p.total, currency: "TRY" })) : "—"}</td></tr>`).join("") || `<tr><td colspan="4" class="muted">Henüz sözleşme verisi yok.</td></tr>`}</tbody>
+        </table></div>`;
+    },
+
+    harita() {
+      const f = state.mapFilter;
+      const metrics = { active: "Aktif ihale sayısı", all: "Tüm ihaleler (geçmiş dahil)", inst: "Kurum sayısı (potansiyel müşteri)", deals: "Bilinen sözleşme bedeli (₺)" };
+      return `
+        <div class="page-head"><div><h1>İhale Haritası</h1><p>Potansiyel müşterilerin ve ihalelerin illere göre yoğunluğu. Bir ile tıklayınca kurumları ve ihaleleri listelenir.</p></div></div>
+        <div class="filters">
+          <select data-map="metric">${Object.entries(metrics).map(([k, l]) => `<option value="${k}" ${f.metric === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+          <select data-map="seg"><option value="">Tüm segmentler</option>${SEGMENTS.map((s) => `<option ${f.seg === s ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>
+        </div>
+        <div class="map-layout">
+          <div class="card card-pad"><div id="trMap" class="tr-map"><p class="muted small">Harita yükleniyor…</p></div><div id="mapLegend" class="map-legend"></div></div>
+          <div class="card card-pad" id="mapSide"><p class="muted small">Ayrıntı için haritada bir il seç.</p></div>
+        </div>
+        <details class="card card-pad" style="margin-top:16px"><summary><b>Tablo görünümü</b></summary><div id="mapTable" class="table-wrap"></div></details>`;
     },
 
     musteriler() {
@@ -754,6 +910,20 @@
               <div class="meta">${[x.amount ? esc(fmtMoney(x.amount)) : "", esc(x.client || ""), `<a href="${esc(x.url)}" target="_blank" rel="noopener">kaynak ↗</a>`].filter(Boolean).join(" · ")}</div></div></div>`).join("") || `<p class="muted small">Yok.</p>`, newDeals.length)}
             ${sec("📰 Öne çıkan haberler", topNews.map((n) => `<div class="list-item"><div><h4 style="font-weight:500"><a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4>
               <div class="meta">${esc(n.source)}</div></div></div>`).join("") || `<p class="muted small">Yok.</p>`, topNews.length)}
+            ${(() => {
+              const rivals = prefs().rivals || [];
+              if (!rivals.length) return "";
+              const hits = [];
+              rivals.forEach((name) => {
+                const words = customerKey(name).split(" ").filter((w) => w.length >= 3 && !/^(İNŞAAT|SANAYİ|TİCARET|ANONİM|ŞİRKETİ|LİMİTED|ORTAKLIĞI|MÜHENDİSLİK|VE|İŞ)$/.test(w)).slice(0, 2);
+                if (!words.length) return;
+                news.filter((n) => now - new Date(n.publishedAt) < 3 * DAY && words.every((w) => customerKey(`${n.title} ${n.summary || ""}`).includes(w)))
+                  .forEach((n) => hits.push({ name, n }));
+                deals.filter((x) => x.winner === name && now - new Date(x.date) < 3 * DAY).forEach((x) => hits.push({ name, n: { title: `Yeni sözleşme: ${x.subject} (${fmtMoney(x.amount)})`, url: x.url, source: x.source } }));
+              });
+              return sec("⚑ Takip ettiğim rakipler (3 gün)", hits.map(({ name, n }) => `<div class="list-item"><div><h4 style="font-weight:500"><a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4>
+                <div class="meta"><a href="#/rakip/${encodeURIComponent(name)}">${esc(name)}</a> · ${esc(n.source)}</div></div></div>`).join("") || `<p class="muted small">Takip ettiğin ${rivals.length} rakip için yeni haber yok.</p>`, hits.length);
+            })()}
           </div>
         </div>`;
     },
@@ -773,6 +943,12 @@
           ${DATA.generatedAt ? `<br>Son güncelleme: <b>${esc(fmtDate(DATA.generatedAt))}</b> (${esc(relDate(DATA.generatedAt))}).` : ""}
           ${DATA.generatedAt && Date.now() - new Date(DATA.generatedAt) > 26 * 3600000 ? `<br><b style="color:var(--urgent)">Veri 1 günden eski — güncellemeyi çalıştır.</b>` : ""}</p>
         </div>
+        ${CLOUD ? `<div class="card card-pad" style="margin-bottom:16px">
+          <h3>Yerel geçmişi buluta aktar</h3>
+          <p class="small" style="margin:0 0 8px">Bilgisayardaki yerel sürümün geçmişini (ihaleler, haberler, sözleşmeler) buluttakiyle birleştirir; aynı kayıt iki kez eklenmez.
+            <b>Tender Radar\\scraper\\store</b> klasöründeki <code>tenders.json</code>, <code>news.json</code> ve <code>deals.json</code> dosyalarını birlikte seç.</p>
+          <button class="btn" data-action="history-import" type="button">⬆ Geçmiş dosyalarını seç</button><input type="file" id="historyFile" accept=".json" multiple hidden>
+        </div>` : ""}
         <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))">
           ${groups.map((g) => `
             <div class="card card-pad"><h3>${esc(g)}</h3>
@@ -828,6 +1004,20 @@
           ${pending ? `<p class="small" style="margin:0">⏳ <b>${pending}</b> değişiklik henüz taranmadı. Taranınca ilgili ihaleler panele otomatik düşer (panel kendini yeniler).</p>` : ""}
           ${SERVER_KW?.scannedAt ? `<p class="muted small" style="margin:6px 0 0">Son tarama: ${esc(fmtDate(SERVER_KW.scannedAt))} · ${SERVER_KW.pos.length} kelime arandı.</p>` : ""}
         </div>
+        ${CLOUD ? (() => {
+          const n = { daily: true, reminders: true, scope: "watch", email: "", ...(prefs().notify || {}) };
+          return `<div class="card card-pad" style="margin-bottom:16px" id="notifyCard">
+            <h3>E-posta bildirimleri</h3>
+            <div class="notify-grid">
+              <label class="check"><input type="checkbox" data-notify="daily" ${n.daily ? "checked" : ""}> Her sabah <b>günlük rapor</b> (08:00 sonrası ilk tarama)</label>
+              <label class="check"><input type="checkbox" data-notify="reminders" ${n.reminders ? "checked" : ""}> İhaleye <b>3 gün kala hatırlatma</b></label>
+              <label>Hatırlatma kapsamı
+                <select data-notify="scope"><option value="watch" ${n.scope !== "all" ? "selected" : ""}>Yalnızca takip listemdeki ihaleler</option><option value="all" ${n.scope === "all" ? "selected" : ""}>Tüm ilgili ihaleler</option></select></label>
+              <label>Alıcı e-posta <input class="input" type="email" data-notify="email" value="${esc(n.email)}" placeholder="Boşsa GitHub'daki MAIL_TO adresi"></label>
+            </div>
+            <p class="muted small" id="mailStatus" style="margin:8px 0 0">Son gönderim bilgisi yükleniyor…</p>
+          </div>`;
+        })() : ""}
         <div class="card card-pad" style="margin-bottom:16px">
           <h3>Nasıl çalışır?</h3>
           <ul class="small" style="margin:0;padding-left:18px;line-height:1.7">
@@ -841,23 +1031,182 @@
           ${kwBlock("pos", "İlgi alanı kelimeleri (aranır)", "ilan.gov.tr'de aranır ve ihale adı/konusunda geçmesi şartıyla listeye alınır.")}
           ${kwBlock("neg", "Hariç tutulacak kelimeler", "Bu kelimeler geçen ihaleler elenir.")}
         </div>
-        <p class="muted small" style="margin-top:16px">Takip listesi, notlar ve müşteri kartları bu tarayıcıda saklanır. Tarayıcı verisini temizlemeden önce veya başka bilgisayara geçerken "Yedek al" kullan.</p>`;
+        <p class="muted small" style="margin-top:16px">${CLOUD
+          ? "Takip listesi, notlar, müşteri kartları ve bildirim ayarları hesabına kayıtlıdır; tüm cihazlarda aynıdır. \"Yedek al\" ile ayrıca dosya olarak saklayabilirsin."
+          : "Takip listesi, notlar ve müşteri kartları bu tarayıcıda saklanır. Tarayıcı verisini temizlemeden önce veya başka bilgisayara geçerken \"Yedek al\" kullan."}</p>`;
     }
   };
 
   function aggregateWinners() {
     const m = new Map();
     deals.forEach((x) => {
-      const r = m.get(x.winner) || { name: x.winner, count: 0, totals: {}, sectors: new Set(), clients: new Set(), last: x.date };
+      const r = m.get(x.winner) || { name: x.winner, count: 0, totals: {}, sectors: new Set(), clients: new Set(), last: x.date, deals: [] };
       r.count++;
+      r.deals.push(x);
       if (x.amount) r.totals[x.amount.currency] = (r.totals[x.amount.currency] || 0) + x.amount.amount;
       r.sectors.add(x.sector);
       if (x.client) r.clients.add(x.client);
       if (new Date(x.date) > new Date(r.last)) r.last = x.date;
       m.set(x.winner, r);
     });
-    return [...m.values()].sort((a, b) => b.count - a.count || new Date(b.last) - new Date(a.last));
+    return [...m.values()].map((r) => {
+      const disc = r.deals.map(discountOf).filter((v) => v != null);
+      const bids = r.deals.map((x) => x.bidders).filter((v) => v != null);
+      r.avgDiscount = disc.length ? disc.reduce((a, b) => a + b, 0) / disc.length : null;
+      r.avgBidders = bids.length ? bids.reduce((a, b) => a + b, 0) / bids.length : null;
+      r.tryTotal = r.totals.TRY || 0;
+      return r;
+    }).sort((a, b) => b.tryTotal - a.tryTotal || b.count - a.count || new Date(b.last) - new Date(a.last));
   }
+
+  // ---------- Grafik ve analitik yardımcıları (tek seri; renkler styles.css'teki --series-1 / --seq-*) ----------
+  const prefs = () => store.get("prefs", {}) || {};
+  const savePrefs = (p) => store.set("prefs", p);
+  const deaccent = (s) => trLower(s).replace(/[çğıöşüâîû]/g, (c) => ({ ç: "c", ğ: "g", ı: "i", ö: "o", ş: "s", ü: "u", â: "a", î: "i", û: "u" }[c])).replace(/[^a-z0-9]/g, "");
+  const monthKey = (iso) => { if (!iso) return null; const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; };
+  const monthLabel = (k) => new Date(k + "-15T12:00:00").toLocaleDateString("tr-TR", { month: "short", year: "2-digit" });
+  const lastMonths = (n) => { const out = []; const d = new Date(); d.setDate(15); for (let i = n - 1; i >= 0; i--) { const x = new Date(d); x.setMonth(d.getMonth() - i); out.push(monthKey(x.toISOString())); } return out; };
+  const fmtNum = (n, dig = 0) => (n == null ? "—" : n.toLocaleString("tr-TR", { maximumFractionDigits: dig }));
+  const countBy = (arr, fn) => { const m = new Map(); arr.forEach((x) => { const k = fn(x); if (k) m.set(k, (m.get(k) || 0) + 1); }); return [...m.entries()].sort((a, b) => b[1] - a[1]); };
+  const sumBy = (arr, fn, valFn) => { const m = new Map(); arr.forEach((x) => { const k = fn(x); const v = valFn(x); if (k && v) m.set(k, (m.get(k) || 0) + v); }); return [...m.entries()].sort((a, b) => b[1] - a[1]); };
+  const tryAmount = (x) => (x.amount && x.amount.currency === "TRY" ? x.amount.amount : 0);
+  const TENDER_TYPES = ["Yapım İşi", "Mal Alımı", "Kiralama ve Hizmet Alımı", "Danışmanlık Hizmet Alımı"];
+  const typeOf = (t) => (t.categories || []).find((c) => TENDER_TYPES.includes(c) || /Alımı|İşi|Hizmet/.test(c)) || (t.procedure || "").split(" · ")[1] || "Diğer";
+  const topicOf = (t) => (t.categories || []).filter((c) => !TENDER_TYPES.includes(c) && !/Alımı|İşi$/.test(c));
+
+  // Yatay çubuk listesi: rows = [[etiket, değer, ipucu?]], değer biçimleyici fmt
+  function barList(rows, fmt = (v) => fmtNum(v), opts = {}) {
+    if (!rows.length) return `<p class="muted small">Veri yok.</p>`;
+    const max = Math.max(...rows.map((r) => r[1]), 1);
+    return `<div class="bars">${rows.map(([label, v, tip, href]) => `
+      <div class="row" data-tip="${esc(tip || `${label}: ${fmt(v)}`)}">
+        <span class="name" title="${esc(label)}">${href ? `<a href="${esc(href)}">${esc(label)}</a>` : esc(label)}</span>
+        <div class="track"><div class="fill" style="width:${Math.max(1.5, (v / max) * 100)}%"></div></div>
+        <span class="val">${fmt(v)}</span>
+      </div>`).join("")}</div>${opts.note ? `<div class="muted small" style="margin-top:6px">${opts.note}</div>` : ""}`;
+  }
+  // Dikey sütun grafiği (aylık): data = [{ key, label, value, tip }]
+  function columnChart(data, fmt = (v) => fmtNum(v)) {
+    if (!data.length || !data.some((d) => d.value)) return `<p class="muted small">Bu dönemde veri yok.</p>`;
+    const W = 320, H = 130, padB = 18, padT = 16, gap = 2;   // küçük görünüm kutusu → yazılar okunur boyutta ölçeklenir
+    const max = Math.max(...data.map((d) => d.value), 1);
+    const bw = (W - gap * (data.length - 1)) / data.length;
+    const maxIdx = data.findIndex((d) => d.value === max);
+    const bars = data.map((d, i) => {
+      const h = d.value ? Math.max(3, ((H - padB - padT) * d.value) / max) : 0;
+      const x = i * (bw + gap), y = H - padB - h, r = Math.min(4, bw / 2, h);
+      const path = h ? `M${x},${H - padB} V${y + r} Q${x},${y} ${x + r},${y} H${x + bw - r} Q${x + bw},${y} ${x + bw},${y + r} V${H - padB} Z` : "";
+      const showLbl = data.length <= 6 || (data.length - 1 - i) % 3 === 0;   // son ay her zaman etiketli
+      return `<g class="col" data-tip="${esc(d.tip || `${d.label}: ${fmt(d.value)}`)}">
+        <rect x="${x}" y="${padT}" width="${bw}" height="${H - padB - padT}" fill="transparent"/>
+        ${path ? `<path d="${path}" class="col-fill"/>` : ""}
+        ${showLbl ? `<text x="${x + bw / 2}" y="${H - 6}" text-anchor="middle" class="axis-lbl">${esc(d.label)}</text>` : ""}
+        ${i === maxIdx ? `<text x="${x + bw / 2}" y="${y - 4}" text-anchor="middle" class="val-lbl">${esc(fmt(d.value))}</text>` : ""}
+      </g>`;
+    }).join("");
+    return `<svg class="colchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Aylık dağılım"><line x1="0" x2="${W}" y1="${H - padB}" y2="${H - padB}" class="baseline"/>${bars}</svg>`;
+  }
+  function statTiles(items) {
+    return `<div class="stat-tiles">${items.map(([label, value, sub]) => `<div class="stat"><div class="label">${esc(label)}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`).join("")}</div>`;
+  }
+  // ---------- İhale haritası ----------
+  const GEO_URL = "https://cdn.jsdelivr.net/gh/alpers/Turkey-Maps-GeoJSON@master/tr-cities.json";
+  let GEO = null;
+  const mapFmt = (metric, v) => (metric === "deals" ? fmtMoney({ amount: v, currency: "TRY" }) : fmtNum(v));
+  function provinceStats() {
+    const f = state.mapFilter;
+    const cs = customers().filter((c) => !f.seg || c.segment === f.seg);
+    const m = new Map();
+    const get = (city) => { const k = deaccent(city); if (!m.has(k)) m.set(k, { name: city, active: 0, all: 0, inst: 0, deals: 0, custs: [], tenders: [] }); return m.get(k); };
+    cs.forEach((c) => {
+      // İhaleler, ihalenin yapıldığı ile; kurum ve sözleşmeler kurumun iline sayılır
+      c.tenders.forEach((t) => { if (!t.city) return; const p = get(t.city); p.all++; if (t.bucket !== "past" && t.bucket !== "cancel") { p.active++; p.tenders.push(t); } });
+      if (c.city) { const p = get(c.city); p.inst++; p.custs.push(c); p.deals += c.deals.reduce((a, x) => a + tryAmount(x), 0); }
+    });
+    return m;
+  }
+  function eachCoord(geom, fn) {
+    const polys = geom.type === "Polygon" ? [geom.coordinates] : geom.type === "MultiPolygon" ? geom.coordinates : [];
+    polys.forEach((poly) => poly.forEach((ring) => ring.forEach(fn)));
+  }
+  async function drawMap() {
+    const el = $("#trMap");
+    if (!el) return;
+    try { if (!GEO) GEO = await (await fetch(GEO_URL)).json(); }
+    catch { el.innerHTML = `<p class="muted small">Harita verisi yüklenemedi (internet bağlantısını kontrol et).</p>`; return; }
+    if (!$("#trMap")) return;   // bu arada başka sayfaya geçildiyse
+    const metric = state.mapFilter.metric;
+    const stats = provinceStats();
+    const k0 = Math.cos((39 * Math.PI) / 180);
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    GEO.features.forEach((ft) => eachCoord(ft.geometry, ([lon, lat]) => { const x = lon * k0, y = -lat; minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }));
+    const W = 1000, s = W / (maxX - minX), H = Math.round((maxY - minY) * s);
+    const pt = ([lon, lat]) => `${((lon * k0 - minX) * s).toFixed(1)},${((-lat - minY) * s).toFixed(1)}`;
+    const vals = GEO.features.map((ft) => { const p = stats.get(deaccent(ft.properties.name)); return p ? p[metric] : 0; });
+    const max = Math.max(...vals, 0);
+    const step = (v) => (!v || !max ? 0 : Math.min(5, Math.max(1, Math.ceil((v / max) * 5))));
+    const sel = state.mapFilter.sel;
+    const paths = GEO.features.map((ft, i) => {
+      const polys = ft.geometry.type === "Polygon" ? [ft.geometry.coordinates] : ft.geometry.coordinates;
+      const d = polys.map((poly) => poly.map((ring) => "M" + ring.map(pt).join("L") + "Z").join("")).join("");
+      const name = ft.properties.name;
+      return `<path d="${d}" class="prov seq-${step(vals[i])} ${sel && deaccent(sel) === deaccent(name) ? "sel" : ""}" data-prov="${esc(name)}" data-tip="${esc(`${name}: ${mapFmt(metric, vals[i])}`)}"/>`;
+    }).join("");
+    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="tr-map-svg" role="img" aria-label="Türkiye il haritası">${paths}</svg>`;
+    const labels = [1, 2, 3, 4, 5].map((n) => mapFmt(metric, (max * n) / 5));
+    $("#mapLegend").innerHTML = max
+      ? `<span class="muted small">0</span>${[1, 2, 3, 4, 5].map((n) => `<span class="sw seq-${n}" title="≤ ${esc(labels[n - 1])}"></span>`).join("")}<span class="muted small">${esc(mapFmt(metric, max))}</span><span class="muted small" style="margin-left:12px"><span class="sw seq-0"></span> veri yok</span>`
+      : `<span class="muted small">Bu ölçüt için henüz veri yok.</span>`;
+    const rows = [...stats.values()].filter((p) => p[metric]).sort((a, b) => b[metric] - a[metric]);
+    $("#mapTable").innerHTML = `<table><thead><tr><th>İl</th><th>Aktif ihale</th><th>Tüm ihaleler</th><th>Kurum</th><th>Bilinen sözleşme</th></tr></thead><tbody>${rows.map((p) => `
+      <tr><td><a href="javascript:void 0" data-prov="${esc(p.name)}">${esc(p.name)}</a></td><td class="num">${p.active}</td><td class="num">${p.all}</td><td class="num">${p.inst}</td><td class="num">${p.deals ? esc(fmtMoney({ amount: p.deals, currency: "TRY" })) : "—"}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">Veri yok.</td></tr>`}</tbody></table>`;
+    renderMapSide(stats);
+  }
+  function renderMapSide(stats) {
+    const side = $("#mapSide"); const sel = state.mapFilter.sel;
+    if (!side || !sel) return;
+    const p = (stats || provinceStats()).get(deaccent(sel));
+    if (!p) { side.innerHTML = `<h3>${esc(sel)}</h3><p class="muted small">Bu ilde kayıtlı ihale veya kurum yok.</p>`; return; }
+    const custs = p.custs.slice().sort((a, b) => b.tenders.length - a.tenders.length);
+    side.innerHTML = `<h3>${esc(p.name)}</h3>
+      ${statTiles([["Aktif ihale", fmtNum(p.active)], ["Tüm ihaleler", fmtNum(p.all)], ["Kurum", fmtNum(p.inst)], ["Bilinen sözleşme", p.deals ? esc(fmtMoney({ amount: p.deals, currency: "TRY" })) : "—"]])}
+      <h4 class="chart-title" style="margin-top:14px">Kurumlar (ihale sayısına göre)</h4>
+      ${barList(custs.slice(0, 8).map((c) => [c.displayName, c.tenders.length, `${c.displayName}: ${c.tenders.length} ihale, ${c.active.length} aktif`, `#/musteri/${encodeURIComponent(c.key)}`]), (v) => `${v} ihale`)}
+      <h4 class="chart-title" style="margin-top:14px">Aktif ihaleler</h4>
+      ${p.tenders.sort((a, b) => new Date(a.tenderDate) - new Date(b.tenderDate)).map((t) => `<div class="list-item" data-open="${esc(t.id)}" style="cursor:pointer"><div style="min-width:0"><h4 style="font-weight:500">${esc(t.title)}</h4>
+        <div class="meta">${esc(t.authority)} · <b style="color:var(--${t.bucket})">${esc(countdown(t.tenderDate))}</b></div></div></div>`).join("") || `<p class="muted small">Aktif ihale yok.</p>`}`;
+  }
+
+  // E-posta günlüğü: Anahtar Kelimeler sayfasında son gönderim bilgisi
+  function loadMailLog() {
+    if (!CLOUD) return;
+    CLOUD.getDataset("mail_log").then((l) => {
+      const el = $("#mailStatus"); if (!el) return;
+      const uid = CLOUD.user.id;
+      const last = l && l.daily && (l.daily[uid] || l.daily.varsayilan);
+      const rem = l && l.reminded && l.reminded[uid] ? Object.keys(l.reminded[uid]).length : 0;
+      el.innerHTML = l ? `Son günlük rapor: <b>${last ? esc(fmtDate(last + "T08:00:00", false)) : "henüz gönderilmedi"}</b> · son 40 günde ${rem} ihale için hatırlatma gönderildi.
+        E-postalar GitHub'daki SMTP ayarlarıyla gönderilir (SETUP.md → E-posta).`
+        : `Henüz e-posta gönderilmedi. GitHub'da SMTP ayarları tanımlanınca (SETUP.md → E-posta) ilk tarama sonrası gönderim başlar.`;
+    }).catch(() => { const el = $("#mailStatus"); if (el) el.textContent = "E-posta günlüğü okunamadı."; });
+  }
+
+  // ---------- Grafik ipucu (tooltip): data-tip taşıyan her öğe ----------
+  const vizTip = document.createElement("div");
+  vizTip.className = "viz-tip"; vizTip.hidden = true;
+  document.body.appendChild(vizTip);
+  document.addEventListener("mouseover", (e) => {
+    const t = e.target.closest && e.target.closest("[data-tip]");
+    if (!t) { vizTip.hidden = true; return; }
+    vizTip.textContent = t.getAttribute("data-tip"); vizTip.hidden = false;
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (vizTip.hidden) return;
+    vizTip.style.left = Math.min(window.innerWidth - vizTip.offsetWidth - 8, e.clientX + 14) + "px";
+    vizTip.style.top = Math.min(window.innerHeight - vizTip.offsetHeight - 8, e.clientY + 16) + "px";
+  });
+
+  const dataNote = `Tutarlar yalnızca kamuya açıklanmış sözleşmelerden (Yatırımlar Dergisi haberleri) hesaplanır; ihale sayıları ilan.gov.tr'de yayımlanan ve anahtar kelimelerinize uyan ihalelerdendir. Veri her taramada birikir.`;
 
   // ---------- Detay çekmecesi ----------
   function openDrawer(id) {
@@ -1106,7 +1455,9 @@
   function render() {
     const v = views[state.view] ? state.view : "ozet";
     $("#view").innerHTML = views[v]();
-    const navV = v === "musteri" ? "musteriler" : v;
+    if (v === "harita") drawMap();
+    if (v === "ayarlar") loadMailLog();
+    const navV = v === "musteri" ? "musteriler" : v === "rakip" ? "rakipler" : v;
     document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navV));
   }
   function updateNavCounts() {
@@ -1135,8 +1486,12 @@
   document.addEventListener("click", (e) => {
     // Kart içindeki dış bağlantılar kartı açmasın, doğrudan kaynağa gitsin
     if (e.target.closest("a[href]") && !e.target.closest("[data-star],[data-action]")) return;
-    const el = e.target.closest("[data-star],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg]");
+    const el = e.target.closest("[data-star],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg],[data-prov]");
     if (!el) return;
+    if (el.dataset.prov) {
+      state.mapFilter.sel = el.dataset.prov; store.set("mapFilter", state.mapFilter);
+      drawMap(); $("#mapSide")?.scrollIntoView({ behavior: "smooth", block: "nearest" }); return;
+    }
     const d = el.dataset;
 
     if (d.star) { e.stopPropagation(); toggleWatch(d.star); return; }
@@ -1183,6 +1538,13 @@
       case "kw-download": download("keywords.json", kwFileContent(), "application/json"); toast("keywords.json indirildi — Tender Radar\\scraper klasörüne kopyala"); break;
       case "reload-now": checkVersion(true); break;
       case "scan-now": if (CLOUD) requestScan(); break;
+      case "pin-rival": {
+        const p = prefs(); const set = new Set(p.rivals || []);
+        set.has(d.name) ? set.delete(d.name) : set.add(d.name);
+        p.rivals = [...set]; savePrefs(p); toast(set.has(d.name) ? "Rakip takibe alındı — haberleri Sabah Özeti'nde" : "Rakip takipten çıkarıldı"); render();
+        break;
+      }
+      case "history-import": $("#historyFile")?.click(); break;
       case "sign-out": if (CLOUD && confirm("Çıkış yapılsın mı?")) CLOUD.signOut(); break;
       case "clear-new": newIds = new Set(); store.set("newIds", []); showNewBanner(); render(); break;
       case "export-settings":
@@ -1246,6 +1608,29 @@
     if (el.dataset.filter) { state.f[el.dataset.filter] = el.value; saveFilters(); render(); }
     if (el.dataset.status) { state.watch[el.dataset.status].status = el.value; saveWatch(); render(); toast("Durum güncellendi"); }
     if (el.dataset.custsort !== undefined) { state.custFilter.sort = el.value; store.set("custFilter", state.custFilter); render(); }
+    if (el.dataset.inst) { state.instFilter[el.dataset.inst] = el.dataset.inst === "top" ? Number(el.value) : el.value; store.set("instFilter", state.instFilter); render(); }
+    if (el.dataset.map) { state.mapFilter[el.dataset.map] = el.value; store.set("mapFilter", state.mapFilter); render(); }
+    if (el.dataset.notify) {
+      const p = prefs(); p.notify = { daily: true, reminders: true, scope: "watch", email: "", ...(p.notify || {}) };
+      p.notify[el.dataset.notify] = el.type === "checkbox" ? el.checked : el.value.trim();
+      savePrefs(p); toast("Bildirim ayarı kaydedildi");
+    }
+    if (el.id === "historyFile" && el.files.length) {
+      Promise.all([...el.files].map((file) => file.text().then((txt) => [file.name.toLowerCase(), JSON.parse(txt)]))).then(async (files) => {
+        const payload = {};
+        for (const [name, json] of files) {
+          const list = Array.isArray(json) ? json : null;
+          if (!list) continue;
+          if (name.includes("tender")) payload.tenders = list;
+          else if (name.includes("deal")) payload.deals = list;
+          else if (name.includes("news")) payload.news = list;
+        }
+        if (!Object.keys(payload).length) { toast("Tanınan dosya yok: scraper\\store içindeki tenders.json, news.json, deals.json dosyalarını seç"); return; }
+        await CLOUD.importHistory(payload);
+        toast(`Geçmiş yüklendi (${Object.entries(payload).map(([k, v]) => `${k}: ${v.length}`).join(", ")}) — bir sonraki taramada (~10–15 dk) birleştirilecek`);
+      }).catch((err) => toast("Dosyalar okunamadı: " + err.message));
+      el.value = "";
+    }
     if (el.dataset.crmField) {
       crmOf(el.dataset.key)[el.dataset.crmField] = el.value.trim();
       saveCrm(); invalidateCustomers();

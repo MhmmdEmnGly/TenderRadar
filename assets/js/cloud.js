@@ -111,7 +111,7 @@
     window.TR_CLOUD = {
       user: session.user,
       username: usernameOf(session.user),
-      state: { crm: us.data?.crm ?? null, watch: us.data?.watch ?? null },
+      state: { crm: us.data?.crm ?? null, watch: us.data?.watch ?? null, prefs: us.data?.prefs ?? null },
       keywords: settings.keywords || null,          // panelde düzenlenen, taranması istenen liste
       scanRequest: settings.scan_request || null,
       save(key, value) { pending[key] = value; clearTimeout(timer); timer = setTimeout(flush, 700); },
@@ -128,6 +128,18 @@
         const { error } = await sb.from("app_settings").upsert({ key: "scan_request", value, updated_at: value.requestedAt }, { onConflict: "key" });
         if (error) throw new Error(error.message);
         this.scanRequest = value;
+      },
+      // Yerel sürümün geçmişini (scraper/store/*.json) buluta aktarma isteği; bir sonraki taramada birleştirilir
+      async importHistory(payload) {
+        const value = { ...payload, requestedAt: new Date().toISOString(), by: this.username };
+        const { error } = await sb.from("app_settings").upsert({ key: "history_import", value, updated_at: value.requestedAt }, { onConflict: "key" });
+        if (error) throw new Error(error.message);
+      },
+      // Gerektiğinde yüklenen ek veri setleri (ör. e-posta günlüğü)
+      async getDataset(key) {
+        const { data, error } = await sb.from("datasets").select("data,generated_at").eq("key", key).maybeSingle();
+        if (error) throw new Error(error.message);
+        return data ? data.data : null;
       },
       async latestVersion() {
         const { data, error } = await sb.from("datasets").select("data,generated_at").eq("key", "version").maybeSingle();

@@ -78,6 +78,21 @@ if ($Cloud) {
       [IO.File]::WriteAllText((Join-Path $Store 'deals.json'), (ConvertTo-Json -InputObject @($row.data.deals) -Depth 12 -Compress), $u8)
     }
   }
+  # Panelden yüklenen yerel geçmiş (history_import): buluttaki geçmişe eklenir, aynı kimlikli kayıt tekrar eklenmez
+  $HistoryImported = $false
+  if ($CloudSettings.history_import) {
+    foreach ($name in 'tenders', 'news', 'deals') {
+      $incoming = @($CloudSettings.history_import.$name | Where-Object { $_ -and $_.id })
+      if (-not $incoming.Count) { continue }
+      $path = Join-Path $Store "$name.json"
+      $existing = if (Test-Path $path) { @(Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ }) } else { @() }
+      $ids = @{}; foreach ($e in $existing) { if ($e) { $ids[[string]$e.id] = 1 } }
+      $add = @($incoming | Where-Object { -not $ids[[string]$_.id] })
+      [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject @(@($existing | Where-Object { $_ }) + $add) -Depth 12 -Compress), $u8)
+      Write-Host "Geçmiş içe aktarma: $name +$($add.Count) (gelen $($incoming.Count))"
+    }
+    $HistoryImported = $true
+  }
 }
 function Unique-Ci($items) {
   $seen = @{}; $out = New-Object System.Collections.ArrayList
@@ -647,6 +662,129 @@ function Write-DataJs([string]$file, [System.Collections.IDictionary]$props) {
   Write-Atomic (Join-Path $DataDir $file) $js
 }
 
+# ================================================================ E-posta: günlük rapor + 3 gün kala hatırlatma
+function Enc([string]$s) { [Net.WebUtility]::HtmlEncode($s) }
+function Days-Left($t) { ([DateTimeOffset]::Parse($t.tenderDate) - $Now).TotalDays }
+function Fmt-Countdown($t) {
+  $ts = [DateTimeOffset]::Parse($t.tenderDate) - $Now
+  if ($ts.TotalSeconds -lt 0) { return 'süresi doldu' }
+  if ($ts.TotalDays -ge 1) { return "{0} gün {1} sa" -f [math]::Floor($ts.TotalDays), $ts.Hours }
+  "{0} sa {1} dk" -f [math]::Floor($ts.TotalHours), $ts.Minutes
+}
+function Fmt-When($t) {
+  $d = [DateTimeOffset]::Parse($t.tenderDate).ToOffset([TimeSpan]::FromHours(3))
+  if ($t.timeKnown -eq $false) { return $d.ToString('dd MMM yyyy ddd', $TR) + ' (saat ilanda yok)' }
+  $d.ToString('dd MMM yyyy ddd HH:mm', $TR)
+}
+function Fmt-Money($v) {
+  if (-not $v -or $null -eq $v.amount) { return '' }
+  $sym = @{ TRY = '₺'; EUR = '€'; USD = '$' }[[string]$v.currency]; $n = [double]$v.amount
+  if ($n -ge 1e9) { return "$sym" + ($n / 1e9).ToString('0.##', $TR) + ' Mr' }
+  if ($n -ge 1e6) { return "$sym" + ($n / 1e6).ToString('0.#', $TR) + ' Mn' }
+  "$sym" + $n.ToString('N0', $TR)
+}
+$MailCss = @{ h2 = 'font:600 15px Segoe UI,Arial;margin:22px 0 8px;padding-left:8px;border-left:4px solid {0};color:#0f1b2d'
+  row = 'padding:9px 0;border-bottom:1px solid #e3e8ef;font:13px Segoe UI,Arial;color:#0f1b2d'; meta = 'color:#4a5a70;font-size:12px' }
+function Mail-TenderRow($t, [string]$color) {
+  $links = @(); if ($t.ekapUrl) { $links += "<a href=""$(Enc $t.ekapUrl)"">EKAP</a>" }
+  $links += "<a href=""$(Enc $(if ($t.ilanUrl) { $t.ilanUrl } else { $t.url }))"">İlan</a>"
+  "<div style=""$($MailCss.row)""><b>$(Enc $t.title)</b><br><span style=""$($MailCss.meta)"">$(Enc $t.authority) · $(Enc $t.dateKind): $(Enc (Fmt-When $t)) · <b style=""color:$color"">$(Enc (Fmt-Countdown $t))</b> · $($links -join ' · ')</span></div>"
+}
+function Mail-Section([string]$title, [string]$color, $items, [scriptblock]$fmt) {
+  $body = if (@($items).Count) { (@($items) | ForEach-Object { & $fmt $_ }) -join "`n" } else { "<div style=""$($MailCss.meta);padding:6px 0"">Yok.</div>" }
+  "<h2 style=""$($MailCss.h2 -f $color)"">$title ($(@($items).Count))</h2>$body"
+}
+function Mail-Wrap([string]$title, [string]$lead, [string]$body) {
+  $panel = $env:PANEL_URL
+@"
+<!doctype html><html lang="tr"><head><meta charset="utf-8"><title>$(Enc $title)</title></head>
+<body style="margin:0;background:#f4f6f9"><div style="max-width:760px;margin:0 auto;padding:24px;background:#fff;font-family:Segoe UI,Arial">
+<div style="font:700 20px Segoe UI,Arial;color:#0f1b2d">$(Enc $title)</div>
+<div style="$($MailCss.meta)">$($Now.ToString('dd MMMM yyyy dddd HH:mm', $TR))</div>
+<div style="margin:16px 0;padding:12px 14px;background:#e0f2f6;border-radius:10px;font:14px Segoe UI,Arial;color:#0f1b2d">$lead</div>
+$body
+<p style="margin-top:24px"><a href="$(Enc $panel)" style="display:inline-block;background:#0e7490;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;font:600 14px Segoe UI,Arial">Paneli aç</a></p>
+<p style="$($MailCss.meta)">Bildirim ayarları: Panel → Anahtar Kelimeler → E-posta bildirimleri.</p>
+</div></body></html>
+"@
+}
+function Send-Mail([string]$to, [string]$subject, [string]$html) {
+  $port = if ($env:SMTP_PORT) { [int]$env:SMTP_PORT } else { 587 }
+  $smtpHost = if ($env:SMTP_HOST) { $env:SMTP_HOST } else { 'smtp.gmail.com' }
+  $smtp = New-Object Net.Mail.SmtpClient($smtpHost, $port)
+  $smtp.EnableSsl = $true
+  $smtp.Credentials = New-Object Net.NetworkCredential($env:SMTP_USER, $env:SMTP_PASS)
+  $m = New-Object Net.Mail.MailMessage
+  $m.From = New-Object Net.Mail.MailAddress($env:SMTP_USER, 'Tender Radar')
+  foreach ($a in ($to -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $m.To.Add($a) }
+  $m.Subject = $subject; $m.SubjectEncoding = [Text.Encoding]::UTF8
+  $m.Body = $html; $m.IsBodyHtml = $true; $m.BodyEncoding = [Text.Encoding]::UTF8
+  try { $smtp.Send($m) } finally { $m.Dispose(); $smtp.Dispose() }
+}
+
+function Send-Notifications {
+  if (-not $env:SMTP_USER -or -not $env:SMTP_PASS) { Log 'E-posta: SMTP ayarları tanımlı değil, atlandı'; return }
+  $users = @(Invoke-Supabase GET 'user_state?select=user_id,watch,prefs' | Where-Object { $_ })
+  if (-not $users.Count) { $users = @([pscustomobject]@{ user_id = 'varsayilan'; watch = $null; prefs = $null }) }
+  $logRow = @(Invoke-Supabase GET 'datasets?key=eq.mail_log&select=data') | Select-Object -First 1
+  $log = if ($logRow -and $logRow.data) { $logRow.data } else { [pscustomobject]@{} }
+  $daily = @{}; $reminded = @{}
+  if ($log.daily) { foreach ($p in $log.daily.PSObject.Properties) { $daily[$p.Name] = $p.Value } }
+  if ($log.reminded) { foreach ($p in $log.reminded.PSObject.Properties) { $h = @{}; foreach ($q in $p.Value.PSObject.Properties) { if (([DateTimeOffset]::Parse($q.Value) - $Now).TotalDays -gt -40) { $h[$q.Name] = $q.Value } }; $reminded[$p.Name] = $h } }
+
+  $today = $Now.ToOffset([TimeSpan]::FromHours(3)).ToString('yyyy-MM-dd')
+  $hourTR = $Now.ToOffset([TimeSpan]::FromHours(3)).Hour
+  $live = @($tenders | Where-Object { -not $_.isCancelled -and (Days-Left $_) -ge 0 } | Sort-Object { [DateTimeOffset]::Parse($_.tenderDate) })
+  $sent = 0
+
+  foreach ($u in $users) {
+    $uid = [string]$u.user_id
+    $n = $u.prefs.notify
+    $to = if ($n -and $n.email) { $n.email } elseif ($env:MAIL_TO) { $env:MAIL_TO } else { $env:SMTP_USER }
+    $wantDaily = -not ($n -and $n.daily -eq $false)
+    $wantRem = -not ($n -and $n.reminders -eq $false)
+    $scopeAll = [bool]($n -and $n.scope -eq 'all')
+    $watchIds = @{}
+    if ($u.watch) { foreach ($p in $u.watch.PSObject.Properties) { if ($p.Value.status -ne 'kapandi') { $watchIds[$p.Name] = $p.Value.status } } }
+    if (-not $reminded[$uid]) { $reminded[$uid] = @{} }
+
+    # 1) 3 gün kala hatırlatma
+    $due = @($live | Where-Object { (Days-Left $_) -le 3 -and ($scopeAll -or $watchIds.ContainsKey([string]$_.id)) -and -not $reminded[$uid].ContainsKey([string]$_.id) })
+    if ($wantRem -and $due.Count) {
+      $body = Mail-Section '⏰ Son 3 gün' '#dc2626' $due { param($t) Mail-TenderRow $t '#dc2626' }
+      $title = if ($due.Count -eq 1) { "⏰ 3 gün kaldı: $($due[0].title)" } else { "⏰ $($due.Count) ihaleye 3 günden az kaldı" }
+      $lead = if ($scopeAll) { 'Aşağıdaki ihalelerin son teklif / ihale tarihine <b>3 günden az</b> kaldı.' } else { 'Takip listenizdeki aşağıdaki ihalelerin son teklif / ihale tarihine <b>3 günden az</b> kaldı.' }
+      Send-Mail $to ("Tender Radar — " + $title) (Mail-Wrap 'Tender Radar — İhale hatırlatması' $lead $body)
+      foreach ($t in $due) { $reminded[$uid][[string]$t.id] = $Now.ToString('o') }
+      $sent++; Log "E-posta: hatırlatma → $to ($($due.Count) ihale)"
+    }
+
+    # 2) Günlük rapor (her gün 08:00'den sonraki ilk taramada, bir kez)
+    if ($wantDaily -and $hourTR -ge 8 -and $daily[$uid] -ne $today) {
+      $in2 = @($live | Where-Object { (Days-Left $_) -lt 2 })
+      $fresh = @($live | Where-Object { $_.firstSeen -and ($Now - [DateTimeOffset]::Parse($_.firstSeen)).TotalHours -lt 26 -and $in2 -notcontains $_ })
+      $week = @($live | Where-Object { $d = Days-Left $_; $d -ge 2 -and $d -le 7 })
+      $watched = @($live | Where-Object { $watchIds.ContainsKey([string]$_.id) })
+      $newDeals = @($deals | Where-Object { ($Now - [DateTimeOffset]::Parse($_.date)).TotalDays -lt 3 })
+      $topNews = @($news | Where-Object { ($Now - [DateTimeOffset]::Parse($_.publishedAt)).TotalHours -lt 30 -and @($_.tags) -notcontains 'Diğer' } | Select-Object -First 8)
+      $lead = "<b>$($in2.Count)</b> ihalenin son günü bugün/yarın · <b>$($fresh.Count)</b> yeni ihale · bu hafta <b>$($week.Count)</b> ihale · takipte <b>$($watched.Count)</b> · <b>$($newDeals.Count)</b> yeni sözleşme/sonuç"
+      $body = (Mail-Section '🔴 Son gün bugün / yarın' '#dc2626' $in2 { param($t) Mail-TenderRow $t '#dc2626' }) +
+              (Mail-Section '★ Takip listem' '#0e7490' $watched { param($t) Mail-TenderRow $t '#0e7490' }) +
+              (Mail-Section '🆕 Son 24 saatte gelen ihaleler' '#0e7490' $fresh { param($t) Mail-TenderRow $t '#0e7490' }) +
+              (Mail-Section '🟠 Bu hafta (2–7 gün)' '#d97706' $week { param($t) Mail-TenderRow $t '#d97706' }) +
+              (Mail-Section '🤝 Yeni sözleşmeler / sonuçlar' '#059669' $newDeals { param($x) "<div style=""$($MailCss.row)""><b>$(Enc $x.winner)</b> — $(Enc $x.subject)<br><span style=""$($MailCss.meta)"">$((@((Fmt-Money $x.amount), (Enc $x.client)) | Where-Object { $_ }) -join ' · ') · <a href=""$(Enc $x.url)"">$(Enc $x.source)</a></span></div>" }) +
+              (Mail-Section '📰 Öne çıkan haberler' '#6b34b8' $topNews { param($x) "<div style=""$($MailCss.row)""><a href=""$(Enc $x.url)"">$(Enc $x.title)</a><br><span style=""$($MailCss.meta)"">$(Enc $x.source)</span></div>" })
+      $subject = "Tender Radar — Günlük rapor ($($Now.ToString('dd MMMM', $TR))): $($in2.Count) acil, $($fresh.Count) yeni ihale"
+      Send-Mail $to $subject (Mail-Wrap '☀ Tender Radar — Günlük Rapor' $lead $body)
+      $daily[$uid] = $today
+      $sent++; Log "E-posta: günlük rapor → $to"
+    }
+  }
+  $row = @([ordered]@{ key = 'mail_log'; data = [ordered]@{ daily = $daily; reminded = $reminded; updatedAt = $Now.ToString('o') }; generated_at = $Now.ToString('o') })
+  Invoke-Supabase POST 'datasets?on_conflict=key' $row @{ Prefer = 'resolution=merge-duplicates,return=minimal' } | Out-Null
+  if ($sent) { Write-Host "::notice title=E-posta::$sent e-posta gönderildi" }
+}
+
 # ================================================================ Çalıştır
 Log '===== Tender Radar güncelleme başladı ====='
 
@@ -741,6 +879,14 @@ if ($Cloud) {
   $srcLine = ($catalog | Where-Object { $_.status -ne 'planned' } | ForEach-Object { "$($_.id)=$($_.status)($($_.count))" }) -join ', '
   Write-Host "::notice title=Tarama özeti::$active aktif ihale, $(@($tenders).Count) ihale (geçmiş dahil), $(@($news).Count) haber, $(@($deals).Count) sözleşme | $srcLine"
   foreach ($c in $catalog | Where-Object { $_.status -eq 'err' }) { Write-Host "::warning title=Kaynak hatası: $($c.id)::$($c.message)" }
+
+  if ($HistoryImported) {
+    Invoke-Supabase DELETE 'app_settings?key=eq.history_import' $null @{ Prefer = 'return=minimal' } | Out-Null
+    Log 'Geçmiş içe aktarma tamamlandı'
+  }
+
+  # E-posta bildirimleri (hata taramayı düşürmez)
+  try { Send-Notifications } catch { Write-Host "::warning title=E-posta gönderilemedi::$($_.Exception.Message)"; Log "E-posta HATA: $($_.Exception.Message)" }
 }
 
 Log ("Bitti: {0} ihale, {1} haber, {2} sözleşme · aranan kelime: {3}" -f $tenders.Count, $news.Count, $deals.Count, $SearchTerms.Count)

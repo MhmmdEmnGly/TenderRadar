@@ -4,12 +4,19 @@ name: Tarama
 #   - sabah taraması (08:00 TR sonrası, o gün henüz sabah taraması yapılmadıysa)
 #   - gün içi periyodik tarama (08:00–20:00 arası, son taramadan 3 saat geçtiyse)
 #   - panelde anahtar kelimeler değiştiyse
-#   - panelde "Şimdi tara" butonuna basıldıysa
+#   - panelde "Şimdi tara" butonuna basıldıysa / geçmiş içe aktarıldıysa
 #   - Actions sekmesinden elle "Run workflow"
+# Tetikleyiciler: GitHub zamanlayıcısı + Supabase pg_cron (yedek; supabase/zamanlayici.sql) "mod=kontrol" ile çağırır.
+# Tarama sonunda e-posta: günlük rapor (sabah) ve takip edilen ihalelere 3 gün kala hatırlatma.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "7,27,47 * * * *"   # saat başı yoğunluğundan kaçınmak için tek dakikalar
   workflow_dispatch:
+    inputs:
+      mod:
+        description: "tam = hemen tam tarama, kontrol = yalnızca gerekirse tara"
+        required: false
+        default: "tam"
   # Tarama kodu/ayarları değişince hemen yeni kodla tara
   push:
     branches: [main]
@@ -37,12 +44,13 @@ jobs:
           SB_URL: ${{ secrets.SUPABASE_URL }}
           SB_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           EVENT: ${{ github.event_name }}
+          MOD: ${{ github.event.inputs.mod }}
         run: |
           set -euo pipefail
           out() { echo "run=$1" >> "$GITHUB_OUTPUT"; echo "reason=$2" >> "$GITHUB_OUTPUT"; echo "Karar: $1 ($2)"; }
           # Kurulum bitmeden (secret'lar yokken) 10 dakikada bir hata e-postası gitmesin: sessizce atla
           if [ -z "${SB_URL:-}" ] || [ -z "${SB_KEY:-}" ]; then echo "::warning::SUPABASE_URL / SUPABASE_SERVICE_KEY secret'ları henüz tanımlı değil (SETUP.md, adım 4) — tarama atlandı"; out false "kurulum bekleniyor"; exit 0; fi
-          if [ "$EVENT" = "workflow_dispatch" ]; then out true "elle başlatıldı"; exit 0; fi
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${MOD:-tam}" != "kontrol" ]; then out true "elle başlatıldı"; exit 0; fi
           if [ "$EVENT" = "push" ]; then out true "tarama kodu güncellendi"; exit 0; fi
 
           SB_URL="${SB_URL%/}"
@@ -56,6 +64,7 @@ jobs:
           kwUsed=$(echo "$ver" | jq -r '.[0].data.keywordsUpdatedAt // empty')
           kwNow=$(echo "$set" | jq -r '.[] | select(.key=="keywords") | .value.updatedAt // empty')
           req=$(echo "$set" | jq -r '.[] | select(.key=="scan_request") | .value.requestedAt // empty')
+          imp=$(echo "$set" | jq -r '.[] | select(.key=="history_import") | .key // empty')
 
           now=$(date -u +%s)
           lastS=0; [ -n "$last" ] && lastS=$(date -u -d "$last" +%s)
@@ -65,6 +74,7 @@ jobs:
 
           if   [ "$lastS" -eq 0 ];                                                   then out true "ilk tarama"
           elif [ "$reqS" -gt "$lastS" ];                                             then out true "panelden Şimdi tara isteği"
+          elif [ -n "$imp" ];                                                        then out true "geçmiş içe aktarma"
           elif [ -n "$kwNow" ] && [ "$kwNow" != "$kwUsed" ];                         then out true "anahtar kelimeler değişti"
           elif [ "$hourTR" -ge 8 ] && [ "$lastS" -lt "$morning" ];                   then out true "sabah taraması"
           elif [ "$hourTR" -ge 8 ] && [ "$hourTR" -lt 20 ] && [ $((now - lastS)) -ge 10800 ]; then out true "3 saatlik periyodik tarama"
@@ -91,6 +101,13 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # E-posta (isteğe bağlı; tanımlı değilse e-posta adımı atlanır). Gmail: 2 adımlı doğrulama + "Uygulama şifresi"
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          PANEL_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: |
           tzutil /s "Turkey Standard Time"
           Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force

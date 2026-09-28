@@ -1,4 +1,5 @@
 {
+  "supabaseUrl": "https://jtnihjeyfoilbsrfcmia.supabase.co",
   "ilanQueries": [
     "SCADA", "otomasyon", "RTU", "PLC", "telekontrol", "telemetri", "uzaktan izleme", "uzaktan kumanda",
     "trafo merkezi", "dağıtım merkezi", "kompanzasyon", "akıllı sayaç", "OSOS", "enerji izleme",

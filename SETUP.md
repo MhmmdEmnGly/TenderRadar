@@ -39,9 +39,28 @@ Panel adresi: `https://<kullanıcı-adın>.github.io/<repo-adı>/`
 | Tam tarama | Actions (Windows PowerShell 5.1) | 08:00 sabah, 08–20 arası 3 saatte bir, kelime değişince, "Şimdi tara" ile |
 | Panel yenileme | Tarayıcı | Dakikada bir yeni veri var mı bakar, varsa kendini yeniler |
 
+## 5. Güncelleme 2 (geçmiş içe aktarma izni)
+Supabase → SQL Editor → `supabase/guncelleme-2.sql` dosyasını yapıştır → **Run**.
+
+## 6. Yedek zamanlayıcı (önerilir)
+GitHub'ın kendi zamanlayıcısı yeni repolarda gecikebilir. Supabase her 10 dakikada bir taramayı "kontrol" modunda tetikler:
+1. GitHub → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**
+   - Repository access: **Only select repositories → TenderRadar**
+   - Repository permissions → **Actions: Read and write** (başka yetki verme) · Süre: 1 yıl
+2. Supabase → SQL Editor → `supabase/zamanlayici.sql` içeriğini yapıştır, iki yerdeki `GITHUB_ANAHTARI_BURAYA` yerine anahtarı yaz → **Run**.
+3. Birkaç dakika sonra kontrol: `select status_code, created from net._http_response order by created desc limit 5;` → `204` görmelisin.
+
+## 7. E-posta bildirimleri (Gmail ile)
+1. Google hesabında **2 Adımlı Doğrulama** açık olmalı → https://myaccount.google.com/apppasswords → uygulama adı "Tender Radar" → 16 haneli **uygulama şifresi**.
+2. GitHub repo → Settings → Secrets and variables → Actions → yeni secret'lar:
+   - `SMTP_USER` = gmail adresin · `SMTP_PASS` = uygulama şifresi (boşluksuz) · `MAIL_TO` = raporun gideceği adres
+   - (Gmail dışı için ayrıca `SMTP_HOST`, `SMTP_PORT`; varsayılan smtp.gmail.com:587)
+3. Panel → Anahtar Kelimeler → **E-posta bildirimleri**: günlük rapor, 3 gün kala hatırlatma, kapsam (takip listem / tüm ihaleler), alıcı adresi.
+
 ## Yerel sürümden veri taşıma
-Yerel panel → Anahtar Kelimeler → **Yedek al** → bulut panel → Anahtar Kelimeler → **Yedeği yükle**.
-Müşteri kartları, notlar, takip listesi ve kelimeler buluta aktarılır.
+- **Müşteri kartları, notlar, takip listesi, kelimeler:** yerel panel → Anahtar Kelimeler → **Yedek al** → bulut panel → Anahtar Kelimeler → **Yedeği yükle**.
+- **İhale / haber / sözleşme geçmişi:** bulut panel → Kaynaklar → **Yerel geçmişi buluta aktar** → yerel `Tender Radar\scraper\store` klasöründeki
+  `tenders.json`, `news.json`, `deals.json` dosyalarını seç. Bir sonraki taramada birleştirilir (aynı kayıt iki kez eklenmez).
 
 ## Güvenlik notları
 - `config.js`'teki anon anahtar herkese açık olacak şekilde tasarlanmıştır; tüm tablolarda satır güvenliği (RLS) açıktır ve

@@ -40,10 +40,13 @@ $KwScanned = Join-Path $Store 'keywords.scanned.json'
 
 # ---------------------------------------------------------------- Bulut (Supabase REST) yardımcıları
 function Invoke-Supabase([string]$Method, [string]$Path, $Body = $null, [hashtable]$Extra = @{}) {
-  $key = $env:SUPABASE_SERVICE_KEY
-  $h = @{ apikey = $key; Authorization = "Bearer $key" }
+  $key = $env:SUPABASE_SERVICE_KEY.Trim()
+  # Yeni Supabase anahtarları (sb_secret_…) yalnızca "apikey" başlığıyla gönderilir; eski JWT anahtarlar Authorization da ister.
+  $h = @{ apikey = $key }
+  if (-not $key.StartsWith('sb_')) { $h.Authorization = "Bearer $key" }
   foreach ($k in $Extra.Keys) { $h[$k] = $Extra[$k] }
-  $p = @{ Uri = "$($env:SUPABASE_URL.TrimEnd('/'))/rest/v1/$Path"; Method = $Method; Headers = $h; UseBasicParsing = $true; TimeoutSec = 120 }
+  # Secret anahtarlar tarayıcıdan gelen isteklerde reddedilir; PowerShell'in varsayılan "Mozilla…" kimliği tarayıcı sanılmasın
+  $p = @{ Uri = "$($env:SUPABASE_URL.Trim().TrimEnd('/'))/rest/v1/$Path"; Method = $Method; Headers = $h; UseBasicParsing = $true; TimeoutSec = 120; UserAgent = 'TenderRadar-Scraper/1.0 (GitHub Actions)' }
   if ($null -ne $Body) {
     $p.Body = (New-Object Text.UTF8Encoding $false).GetBytes((ConvertTo-Json -InputObject $Body -Depth 12 -Compress))
     $p.ContentType = 'application/json; charset=utf-8'

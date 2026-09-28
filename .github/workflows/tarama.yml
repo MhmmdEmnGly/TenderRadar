@@ -45,7 +45,10 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then out true "elle başlatıldı"; exit 0; fi
           if [ "$EVENT" = "push" ]; then out true "tarama kodu güncellendi"; exit 0; fi
 
-          q() { curl -fsS "$SB_URL/rest/v1/$1" -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY"; }
+          SB_URL="${SB_URL%/}"
+          # Yeni anahtarlar (sb_secret_…) yalnızca apikey başlığıyla; eski JWT anahtarlar Authorization da ister
+          if [[ "$SB_KEY" == sb_* ]]; then AUTH=(); else AUTH=(-H "Authorization: Bearer $SB_KEY"); fi
+          q() { curl -fsS "$SB_URL/rest/v1/$1" -H "apikey: $SB_KEY" "${AUTH[@]}"; }
           ver=$(q "datasets?key=eq.version&select=data,generated_at")
           set=$(q "app_settings?select=key,value")
 

@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+  # Tarama kodu/ayarları değişince hemen yeni kodla tara
+  push:
+    branches: [main]
+    paths:
+      - "scraper/**"
+      - ".github/workflows/tarama.yml"
 
 concurrency:
   group: tarama
@@ -37,6 +43,7 @@ jobs:
           # Kurulum bitmeden (secret'lar yokken) 10 dakikada bir hata e-postası gitmesin: sessizce atla
           if [ -z "${SB_URL:-}" ] || [ -z "${SB_KEY:-}" ]; then echo "::warning::SUPABASE_URL / SUPABASE_SERVICE_KEY secret'ları henüz tanımlı değil (SETUP.md, adım 4) — tarama atlandı"; out false "kurulum bekleniyor"; exit 0; fi
           if [ "$EVENT" = "workflow_dispatch" ]; then out true "elle başlatıldı"; exit 0; fi
+          if [ "$EVENT" = "push" ]; then out true "tarama kodu güncellendi"; exit 0; fi
 
           q() { curl -fsS "$SB_URL/rest/v1/$1" -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY"; }
           ver=$(q "datasets?key=eq.version&select=data,generated_at")

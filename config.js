@@ -5,8 +5,8 @@
  * service_role anahtarını ASLA buraya yazma — o yalnızca GitHub Secrets'ta durur.
  */
 window.TR_CONFIG = {
-  supabaseUrl: "SUPABASE_URL_BURAYA",          // ör. https://abcdefghijkl.supabase.co
-  supabaseAnonKey: "SUPABASE_ANON_KEY_BURAYA", // Project Settings → API Keys → anon / publishable
+  supabaseUrl: "https://jtnihjeyfoilbsrfcmia.supabase.co",
+  supabaseAnonKey: "sb_publishable_vWb_FHsmSrOZjDxD83XMpQ_mVo0zp5L", // publishable (tarayıcı için tasarlanmış, gizli değil)
   // Kullanıcı adıyla giriş: "muhammed" yazılırsa "muhammed@tenderradar.app" hesabıyla oturum açılır.
   // Supabase'de kullanıcıyı bu biçimde oluştur (SETUP.md). Tam e-posta ile de giriş yapılabilir.
   usernameDomain: "tenderradar.app"

@@ -747,9 +747,13 @@ function Send-Notifications {
     $watchIds = @{}
     if ($u.watch) { foreach ($p in $u.watch.PSObject.Properties) { if ($p.Value.status -ne 'kapandi') { $watchIds[$p.Name] = $p.Value.status } } }
     if (-not $reminded[$uid]) { $reminded[$uid] = @{} }
+    # Kullanıcının panelde "✕" ile listeden çıkardığı ihaleler e-postalara girmez
+    $dis = @{}
+    if ($u.prefs -and $u.prefs.dismissed) { foreach ($p in $u.prefs.dismissed.PSObject.Properties) { $dis[$p.Name] = 1 } }
+    $liveU = @($live | Where-Object { -not $dis.ContainsKey([string]$_.id) })
 
     # 1) 3 gün kala hatırlatma
-    $due = @($live | Where-Object { (Days-Left $_) -le 3 -and ($scopeAll -or $watchIds.ContainsKey([string]$_.id)) -and -not $reminded[$uid].ContainsKey([string]$_.id) })
+    $due = @($liveU | Where-Object { (Days-Left $_) -le 3 -and ($scopeAll -or $watchIds.ContainsKey([string]$_.id)) -and -not $reminded[$uid].ContainsKey([string]$_.id) })
     if ($wantRem -and $due.Count) {
       $body = Mail-Section '⏰ Son 3 gün' '#dc2626' $due { param($t) Mail-TenderRow $t '#dc2626' }
       $title = if ($due.Count -eq 1) { "⏰ 3 gün kaldı: $($due[0].title)" } else { "⏰ $($due.Count) ihaleye 3 günden az kaldı" }
@@ -761,10 +765,10 @@ function Send-Notifications {
 
     # 2) Günlük rapor (her gün 08:00'den sonraki ilk taramada, bir kez)
     if ($wantDaily -and $hourTR -ge 8 -and $daily[$uid] -ne $today) {
-      $in2 = @($live | Where-Object { (Days-Left $_) -lt 2 })
-      $fresh = @($live | Where-Object { $_.firstSeen -and ($Now - [DateTimeOffset]::Parse($_.firstSeen)).TotalHours -lt 26 -and $in2 -notcontains $_ })
-      $week = @($live | Where-Object { $d = Days-Left $_; $d -ge 2 -and $d -le 7 })
-      $watched = @($live | Where-Object { $watchIds.ContainsKey([string]$_.id) })
+      $in2 = @($liveU | Where-Object { (Days-Left $_) -lt 2 })
+      $fresh = @($liveU | Where-Object { $_.firstSeen -and ($Now - [DateTimeOffset]::Parse($_.firstSeen)).TotalHours -lt 26 -and $in2 -notcontains $_ })
+      $week = @($liveU | Where-Object { $d = Days-Left $_; $d -ge 2 -and $d -le 7 })
+      $watched = @($liveU | Where-Object { $watchIds.ContainsKey([string]$_.id) })
       $newDeals = @($deals | Where-Object { ($Now - [DateTimeOffset]::Parse($_.date)).TotalDays -lt 3 })
       $topNews = @($news | Where-Object { ($Now - [DateTimeOffset]::Parse($_.publishedAt)).TotalHours -lt 30 -and @($_.tags) -notcontains 'Diğer' } | Select-Object -First 8)
       $lead = "<b>$($in2.Count)</b> ihalenin son günü bugün/yarın · <b>$($fresh.Count)</b> yeni ihale · bu hafta <b>$($week.Count)</b> ihale · takipte <b>$($watched.Count)</b> · <b>$($newDeals.Count)</b> yeni sözleşme/sonuç"

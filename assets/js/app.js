@@ -180,8 +180,54 @@
     ? new Date(t.tenderDate).toLocaleDateString("tr-TR", { day: "2-digit", month: "short", year: "numeric", weekday: "short" }) + " (saat ilanda yok)"
     : fmtDate(t.tenderDate);
 
+  // ---------- Listeden çıkarma + süresi dolanların temizlenmesi ----------
+  // İhale tarihinden 3 gün sonra ihale tüm listelerden kalkar (analitik ve müşteri kartı geçmişinde kalır).
+  // Kullanıcının "✕" ile çıkardıkları prefs.dismissed'da tutulur (hesaba kayıtlı, tüm cihazlarda aynı).
+  const EXPIRE_DAYS = 3;
+  const isExpired = (t) => daysLeft(t.tenderDate) < -EXPIRE_DAYS;
+  const dismissedMap = () => prefs().dismissed || {};
+  const isDismissed = (t) => Object.prototype.hasOwnProperty.call(dismissedMap(), t.id);
+  const listable = (t) => !isExpired(t) && !isDismissed(t);
+  function purgeDismissed() {
+    const p = prefs(); const d = { ...(p.dismissed || {}) }; let changed = false;
+    for (const [id, x] of Object.entries(d)) {
+      const t = tenders.find((y) => y.id === id);
+      const date = t ? t.tenderDate : x.date;
+      if (!date || daysLeft(date) < -EXPIRE_DAYS) { delete d[id]; changed = true; }
+    }
+    if (changed) { p.dismissed = d; savePrefs(p); }
+  }
+  function dismissTender(id) {
+    const t = tenders.find((x) => x.id === id); if (!t) return;
+    const p = prefs(); p.dismissed = { ...(p.dismissed || {}), [id]: { at: new Date().toISOString(), title: t.title, authority: t.authority, date: t.tenderDate } };
+    savePrefs(p);
+    if (state.watch[id]) { delete state.watch[id]; saveWatch(); }   // çıkarılan ihale takipten de düşer
+    invalidateCustomers(); closeDrawer(); render(); updateNavCounts();
+    toast("İhale listeden çıkarıldı — sayfanın altındaki \"Listeden çıkardığım ihaleler\" bölümünden geri alabilirsin");
+  }
+  function restoreTender(id) {
+    const p = prefs(); const d = { ...(p.dismissed || {}) }; delete d[id]; p.dismissed = d; savePrefs(p);
+    invalidateCustomers(); render(); updateNavCounts(); toast("İhale listeye geri alındı");
+  }
+  // Yanlışlıkla basmaya karşı onay penceresi (varsayılan odak "Vazgeç"te)
+  function confirmBox({ title, html, ok, cancel = "Vazgeç" }) {
+    return new Promise((resolve) => {
+      const m = document.createElement("div");
+      m.className = "modal-backdrop";
+      m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle"><h3 id="mTitle">${esc(title)}</h3><div class="modal-body">${html}</div>
+        <div class="actions modal-actions"><button class="btn" data-m="no" type="button">${esc(cancel)}</button><button class="btn danger" data-m="yes" type="button">${esc(ok)}</button></div></div>`;
+      document.body.appendChild(m);
+      const done = (v) => { m.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(false); } };
+      document.addEventListener("keydown", onKey, true);
+      m.addEventListener("click", (e) => { const b = e.target.closest("[data-m]"); if (b) done(b.dataset.m === "yes"); else if (e.target === m) done(false); });
+      m.querySelector('[data-m="no"]').focus();
+    });
+  }
+
   function filteredTenders() {
     return tenders
+      .filter(listable)
       .map((t) => ({ ...t, rel: relevance(t), bucket: t.isCancelled ? "cancel" : bucketOf(t.tenderDate) }))
       .filter((t) => t.rel.score >= 0)
       .filter((t) => !state.f.onlyRelevant || t.rel.score > 0)
@@ -313,7 +359,7 @@
       const cust = { ...c, displayName: data.name || titleTR(c.name), segment: data.segment || segmentOf(c.name),
         city: data.city || (ts[0] && ts[0].city) || "" };
       cust.tenders = ts;
-      cust.active = ts.filter((t) => t.bucket !== "past" && t.bucket !== "cancel");
+      cust.active = ts.filter((t) => t.bucket !== "past" && t.bucket !== "cancel" && !isDismissed(t));
       cust.deals = deals.filter((x) => clientMatches(cust, x.client));
       const al = aliasesOf(c.name, data.aliases);
       cust.aliases = al;
@@ -340,12 +386,13 @@
     return `
       <article class="t-card" data-open="${esc(t.id)}" style="--c: var(--${t.bucket === "past" || t.bucket === "cancel" ? "past" : t.bucket})">
         <div class="top">
+          <button class="star ${w ? "on" : ""}" data-star="${esc(t.id)}" title="${w ? "Takipten çıkar" : "Takibe al"}" aria-label="${w ? "Takipten çıkar" : "Takibe al"}" type="button">${w ? "★" : "☆"}</button>
           <span class="badge src-${esc(t.sourceType)}">${esc(SOURCE_TYPES[t.sourceType] || t.sourceType)}</span>
           ${newIds.has(t.id) ? `<span class="badge new">YENİ</span>` : ""}
           ${t.isCancelled ? `<span class="badge warn">İPTAL</span>` : t.isAddendum ? `<span class="badge warn">Zeyilname</span>` : ""}
           ${status ? `<span class="badge status">${esc(status.label)}</span>` : ""}
           ${t.rel.score ? `<span class="score" title="Eşleşen: ${esc(t.rel.hits.join(", "))}">● ${t.rel.score} eşleşme</span>` : ""}
-          <button class="star ${w ? "on" : ""}" data-star="${esc(t.id)}" title="${w ? "Takipten çıkar" : "Takibe al"}" style="margin-left:auto">${w ? "★" : "☆"}</button>
+          <button class="dismiss" data-dismiss="${esc(t.id)}" title="Bu ihaleyi listeden çıkar" aria-label="Listeden çıkar" type="button">✕</button>
         </div>
         <h4>${hl(t.title)}</h4>
         <div class="auth">${hl(t.authority)}</div>
@@ -460,8 +507,26 @@
         <div class="board">${lane("urgent", by("urgent"))}${lane("week", by("week"))}${lane("later", by("later"))}</div>
         ${cancelled.length ? `<details class="past-wrap"><summary>İptal edilen ihaleler (${cancelled.length})</summary>
           <div class="board" style="margin-top:10px"><section class="lane past">${cancelled.map(tenderCard).join("")}</section></div></details>` : ""}
-        ${past.length ? `<details class="past-wrap"><summary>Süresi geçmiş ihaleler (${past.length}) — sonuç takibi için</summary>
-          <div class="board" style="margin-top:10px"><section class="lane past">${past.map(tenderCard).join("")}</section></div></details>` : ""}`;
+        ${past.length ? `<details class="past-wrap"><summary>Süresi geçmiş ihaleler (${past.length}) — tarihinden 3 gün sonra listeden kalkar</summary>
+          <div class="board" style="margin-top:10px"><section class="lane past">${past.map(tenderCard).join("")}</section></div></details>` : ""}
+        ${(() => {
+          const dis = Object.entries(dismissedMap())
+            .map(([id, x]) => ({ id, ...x, t: tenders.find((y) => y.id === id) }))
+            .sort((a, b) => new Date(b.at) - new Date(a.at));
+          return `<details class="past-wrap dismissed-wrap" ${state.openDismissed ? "open" : ""} data-toggle-dismissed>
+            <summary>Listeden çıkardığım ihaleler (${dis.length})</summary>
+            ${dis.length ? `<div class="card table-wrap" style="margin-top:10px"><table>
+              <thead><tr><th>İhale</th><th>İdare</th><th>İhale tarihi</th><th>Çıkarıldı</th><th></th></tr></thead>
+              <tbody>${dis.map((x) => `<tr>
+                <td>${x.t ? `<a href="javascript:void 0" data-open="${esc(x.id)}">${esc(x.title)}</a>` : esc(x.title)}</td>
+                <td class="small">${esc(x.authority || "")}</td>
+                <td class="small">${x.date ? esc(fmtDate(x.date, false)) + ` <span class="muted">(${esc(countdown(x.date))})</span>` : "—"}</td>
+                <td class="small">${esc(relDate(x.at))}</td>
+                <td><button class="btn small" data-restore="${esc(x.id)}" type="button">↩ Geri al</button></td></tr>`).join("")}</tbody></table></div>
+              <p class="muted small">Bu ihaleler ihale tarihinden 3 gün sonra buradan da otomatik silinir. Çıkardığın ihaleler için hatırlatma e-postası gönderilmez.</p>`
+              : `<p class="muted small" style="margin:10px 0">Henüz listeden çıkardığın ihale yok. Kartın sağ üstündeki ✕ ile çıkarabilirsin.</p>`}
+          </details>`;
+        })()}`;
     },
 
     piyasa() {
@@ -524,7 +589,7 @@
 
     takip() {
       const watched = tenders
-        .filter((t) => state.watch[t.id])
+        .filter((t) => state.watch[t.id] && listable(t))
         .map((t) => ({ ...t, bucket: bucketOf(t.tenderDate), rel: relevance(t) }))
         .sort((a, b) => new Date(a.tenderDate) - new Date(b.tenderDate));
       return `
@@ -863,7 +928,7 @@
 
     sabah() {
       const now = Date.now();
-      const all = tenders.filter((t) => relevance(t).score >= 0).map((t) => ({ ...t, bucket: t.isCancelled ? "cancel" : bucketOf(t.tenderDate) }));
+      const all = tenders.filter((t) => listable(t) && relevance(t).score >= 0).map((t) => ({ ...t, bucket: t.isCancelled ? "cancel" : bucketOf(t.tenderDate) }));
       const live = all.filter((t) => t.bucket !== "past" && t.bucket !== "cancel");
       const in2 = live.filter((t) => daysLeft(t.tenderDate) < 2).sort((a, b) => new Date(a.tenderDate) - new Date(b.tenderDate));
       const since = now - 26 * 3600000;
@@ -1120,7 +1185,7 @@
     const get = (city) => { const k = deaccent(city); if (!m.has(k)) m.set(k, { name: city, active: 0, all: 0, inst: 0, deals: 0, custs: [], tenders: [] }); return m.get(k); };
     cs.forEach((c) => {
       // İhaleler, ihalenin yapıldığı ile; kurum ve sözleşmeler kurumun iline sayılır
-      c.tenders.forEach((t) => { if (!t.city) return; const p = get(t.city); p.all++; if (t.bucket !== "past" && t.bucket !== "cancel") { p.active++; p.tenders.push(t); } });
+      c.tenders.forEach((t) => { if (!t.city) return; const p = get(t.city); p.all++; if (t.bucket !== "past" && t.bucket !== "cancel" && !isDismissed(t)) { p.active++; p.tenders.push(t); } });
       if (c.city) { const p = get(c.city); p.inst++; p.custs.push(c); p.deals += c.deals.reduce((a, x) => a + tryAmount(x), 0); }
     });
     return m;
@@ -1245,6 +1310,8 @@
         ${t.ekapUrl ? `<p class="muted small">EKAP bağlantısı, İKN ile arama sayfasını açar; Cloudflare "gerçek kişi" kutusunu işaretleyince ihale listelenir (EKAP'ın zorunlu güvenlik adımı).</p>` : ""}
         <div class="actions">
           <button class="btn ${w ? "on" : "primary"}" data-star="${esc(t.id)}" type="button">${w ? "★ Takipte" : "☆ Takibe al"}</button>
+          ${isDismissed(t) ? `<button class="btn" data-restore="${esc(t.id)}" type="button">↩ Listeye geri al</button>`
+            : `<button class="btn ghost" data-dismiss="${esc(t.id)}" type="button">✕ Listeden çıkar</button>`}
           <button class="btn" data-action="ics" data-id="${esc(t.id)}" type="button">📅 Takvime ekle</button>
           <button class="btn" data-action="copy" data-id="${esc(t.id)}" type="button">⧉ Özeti kopyala</button>
         </div>
@@ -1461,7 +1528,7 @@
     document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navV));
   }
   function updateNavCounts() {
-    const active = tenders.filter((t) => daysLeft(t.tenderDate) >= 0 && relevance(t).score >= 0).length;
+    const active = tenders.filter((t) => daysLeft(t.tenderDate) >= 0 && !isDismissed(t) && relevance(t).score >= 0).length;
     $("#navCountTenders").textContent = active || "";
     $("#navCountWatch").textContent = Object.keys(state.watch).length || "";
   }
@@ -1486,8 +1553,20 @@
   document.addEventListener("click", (e) => {
     // Kart içindeki dış bağlantılar kartı açmasın, doğrudan kaynağa gitsin
     if (e.target.closest("a[href]") && !e.target.closest("[data-star],[data-action]")) return;
-    const el = e.target.closest("[data-star],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg],[data-prov]");
+    const el = e.target.closest("[data-star],[data-dismiss],[data-restore],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg],[data-prov]");
     if (!el) return;
+    if (el.dataset.dismiss) {
+      e.stopPropagation();
+      const t = tenders.find((x) => x.id === el.dataset.dismiss);
+      confirmBox({
+        title: "Bu ihaleyi listeden çıkarmak istediğine emin misin?",
+        html: `<p style="margin:0 0 6px"><b>${esc(t ? t.title : "")}</b></p><p class="muted small" style="margin:0">${esc(t ? t.authority : "")}</p>
+          <p class="small" style="margin:10px 0 0">İhale tüm listelerden kalkar ve takip listenden çıkar. Sayfanın altındaki <b>"Listeden çıkardığım ihaleler"</b> bölümünden istediğin zaman geri alabilirsin.</p>`,
+        ok: "Evet, listeden çıkar"
+      }).then((yes) => { if (yes) dismissTender(el.dataset.dismiss); });
+      return;
+    }
+    if (el.dataset.restore) { e.stopPropagation(); restoreTender(el.dataset.restore); if ($("#drawer").dataset.id === el.dataset.restore) openDrawer(el.dataset.restore); return; }
     if (el.dataset.prov) {
       state.mapFilter.sel = el.dataset.prov; store.set("mapFilter", state.mapFilter);
       drawMap(); $("#mapSide")?.scrollIntoView({ behavior: "smooth", block: "nearest" }); return;
@@ -1722,6 +1801,8 @@
   }
   if (DATA.generatedAt) $("#dataStamp").textContent = "Veri: " + fmtDate(DATA.generatedAt);
   window.addEventListener("hashchange", route);
+  purgeDismissed();   // tarihi 3 günden fazla geçmiş "çıkarılanlar" kaydını temizle
+  document.addEventListener("toggle", (e) => { if (e.target.matches && e.target.matches("[data-toggle-dismissed]")) state.openDismissed = e.target.open; }, true);
   updateNavCounts();
   route();
   showNewBanner();

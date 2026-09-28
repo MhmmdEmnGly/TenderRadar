@@ -94,5 +94,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true")
     a = ap.parse_args()
-    if a.probe:
-        probe()
+    try:
+        if a.probe:
+            probe()
+    except Exception as e:  # hata metni Actions özetinde (girişsiz) görünsün
+        import traceback
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        print(f"::error title=Bülten hatası::{type(e).__name__}: {e} | {tb[-1500:]}".replace("\n", "%0A"))
+        sys.exit(1)

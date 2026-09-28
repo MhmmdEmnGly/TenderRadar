@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tender Radar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".6"/><path d="M12 12 L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/></svg>
+        <div><strong>Tender Radar</strong><small>İş Geliştirme Paneli</small></div>
+      </div>
+      <nav class="nav">
+        <a href="#/sabah" data-view="sabah"><span class="ico">☀</span>Sabah Özeti</a>
+        <a href="#/ozet" data-view="ozet"><span class="ico">◎</span>Genel Bakış</a>
+        <a href="#/ihaleler" data-view="ihaleler"><span class="ico">▦</span>İhaleler <em class="count" id="navCountTenders"></em></a>
+        <a href="#/piyasa" data-view="piyasa"><span class="ico">≋</span>Piyasa & Sözleşmeler</a>
+        <a href="#/musteriler" data-view="musteriler"><span class="ico">◈</span>Müşteri Kartları</a>
+        <a href="#/takip" data-view="takip"><span class="ico">★</span>Takip Listem <em class="count" id="navCountWatch"></em></a>
+        <a href="#/rakipler" data-view="rakipler"><span class="ico">⚑</span>Rakip Analizi</a>
+        <a href="#/kaynaklar" data-view="kaynaklar"><span class="ico">⛁</span>Kaynaklar</a>
+        <a href="#/ayarlar" data-view="ayarlar"><span class="ico">⚙</span>Anahtar Kelimeler</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="userBox" class="user-box" hidden></div>
+        <div id="dataStamp" class="muted small"></div>
+        <button class="btn ghost small" id="themeToggle" type="button">◐ Tema</button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="btn ghost icon-only" id="menuToggle" type="button" aria-label="Menü">☰</button>
+        <div class="search">
+          <input id="globalSearch" type="search" placeholder="İhale, idare, firma, İKN ara…  ( / )" autocomplete="off">
+        </div>
+        <div class="topbar-right">
+          <span class="today" id="todayLabel"></span>
+        </div>
+      </header>
+      <div id="updateBanner" class="banner banner-new" hidden></div>
+      <div id="demoBanner" class="banner" hidden>
+        Henüz tarama verisi yok. İlk bulut taraması tamamlanınca ihaleler burada görünecek (Kaynaklar → Şimdi tara).
+      </div>
+      <main id="view" class="view" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="drawer" aria-hidden="true"></aside>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <!-- Giriş ekranı (cloud.js yönetir). Veri, giriş yapılmadan yüklenmez. -->
+  <div id="authGate" class="auth-gate"><div class="auth-card"><p class="muted">Yükleniyor…</p></div></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script src="config.js"></script>
+  <script src="assets/js/cloud.js"></script>
+  <!-- app.js, giriş ve veri yüklemesinden sonra cloud.js tarafından eklenir -->
+  <noscript>Tender Radar için JavaScript gereklidir.</noscript>
+</body>
+</html>

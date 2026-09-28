@@ -1,0 +1,7 @@
+# Tarama çıktıları ve önbellek — repoya girmez (veri Supabase'de)
+data/
+scraper/cache/
+scraper/store/
+scraper/logs/
+reports/
+*.tmp

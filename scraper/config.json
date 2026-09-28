@@ -1,0 +1,49 @@
+{
+  "ilanQueries": [
+    "SCADA", "otomasyon", "RTU", "PLC", "telekontrol", "telemetri", "uzaktan izleme", "uzaktan kumanda",
+    "trafo merkezi", "dağıtım merkezi", "kompanzasyon", "akıllı sayaç", "OSOS", "enerji izleme",
+    "enerji yönetim", "kontrol sistemi", "IEC 61850", "koruma röle", "DCS", "OMS", "ADMS", "fider",
+    "SCADA sistemi", "kumanda panosu", "pompa istasyonu otomasyon", "arıtma otomasyon"
+  ],
+  "keywords": [
+    "scada", "otomasyon", "rtu", "plc", "telekontrol", "telemetri", "uzaktan izleme", "uzaktan kumanda",
+    "iec 61850", "iec 60870", "dağıtım merkezi", "trafo merkezi", "kompanzasyon", "adms", "oms",
+    "hmi", "dcs", "akıllı sayaç", "osos", "enerji izleme", "enerji yönetim", "kontrol sistemi",
+    "koruma röle", "röle", "fider", "og hücre", "modem", "pano"
+  ],
+  "strongKeywords": [
+    "scada", "otomasyon", "rtu", "plc", "telekontrol", "telemetri", "uzaktan izleme", "uzaktan kumanda",
+    "iec 61850", "iec 60870", "adms", "dcs", "hmi", "akıllı sayaç", "osos", "enerji izleme",
+    "enerji yönetim", "kontrol sistemi", "koruma röle", "trafo merkezi", "dağıtım merkezi", "kompanzasyon"
+  ],
+  "negativeKeywords": [
+    "akaryakıt", "temizlik hizmeti", "yemek", "kırtasiye", "hastane bilgi yönetim", "otopark otomasyon",
+    "kütüphane otomasyon", "ilaç", "tıbbi sarf", "araç kiralama", "personel çalıştırılmasına",
+    "bap otomasyon", "belediye otomasyon", "süreç yönetim bilgi sistemi", "okul otomasyon", "otel otomasyon",
+    "yoğuşmalı kazan", "personel taşıma", "tarla", "kiraya verilecek", "kiraya verme",
+    "geçiş kontrol", "x-ray", "bagaj kontrol", "metal dedektör"
+  ],
+  "yatirimlarPages": [
+    "https://yatirimlar.com/"
+  ],
+  "rssFeeds": [
+    { "id": "enerjigunlugu", "name": "Enerji Günlüğü", "url": "https://www.enerjigunlugu.net/rss", "filter": true },
+    { "id": "yenienerji", "name": "YeniEnerji", "url": "https://www.yenienerji.com/rss", "filter": true }
+  ],
+  "googleNewsQueries": [
+    "SCADA ihale", "SCADA sözleşme", "elektrik dağıtım SCADA", "EDAŞ ihale", "EDAŞ yatırım",
+    "otomasyon sözleşme imzaladı", "trafo merkezi ihale", "akıllı sayaç ihale", "EPDK dağıtım yatırım"
+  ],
+  "newsKeywords": [
+    "scada", "otomasyon", "edaş", "elektrik dağıtım", "dağıtım şirket", "trafo", "şebeke", "epdk", "teiaş",
+    "akıllı sayaç", "depolama", "ges", "res", "enerji", "sözleşme", "ihale", "yatırım", "kontrol", "dijital"
+  ],
+  "tenderPastDays": 15,
+  "historyDays": 365,
+  "newsDays": 60,
+  "morningReport": {
+    "email": { "enabled": false, "to": "" },
+    "openInBrowser": true,
+    "toast": true
+  }
+}

@@ -1,0 +1,94 @@
+name: Tarama
+
+# Her 10 dakikada hafif bir kontrol (Ubuntu, birkaç saniye) çalışır; yalnızca gerekirse tam tarama (Windows) başlar:
+#   - sabah taraması (08:00 TR sonrası, o gün henüz sabah taraması yapılmadıysa)
+#   - gün içi periyodik tarama (08:00–20:00 arası, son taramadan 3 saat geçtiyse)
+#   - panelde anahtar kelimeler değiştiyse
+#   - panelde "Şimdi tara" butonuna basıldıysa
+#   - Actions sekmesinden elle "Run workflow"
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tarama
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  kontrol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.karar.outputs.run }}
+      reason: ${{ steps.karar.outputs.reason }}
+    steps:
+      - id: karar
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          out() { echo "run=$1" >> "$GITHUB_OUTPUT"; echo "reason=$2" >> "$GITHUB_OUTPUT"; echo "Karar: $1 ($2)"; }
+          if [ -z "${SB_URL:-}" ] || [ -z "${SB_KEY:-}" ]; then echo "::error::SUPABASE_URL / SUPABASE_SERVICE_KEY secret'ları tanımlı değil (SETUP.md)"; exit 1; fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then out true "elle başlatıldı"; exit 0; fi
+
+          q() { curl -fsS "$SB_URL/rest/v1/$1" -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY"; }
+          ver=$(q "datasets?key=eq.version&select=data,generated_at")
+          set=$(q "app_settings?select=key,value")
+
+          last=$(echo "$ver" | jq -r '.[0].data.generatedAt // .[0].generated_at // empty')
+          kwUsed=$(echo "$ver" | jq -r '.[0].data.keywordsUpdatedAt // empty')
+          kwNow=$(echo "$set" | jq -r '.[] | select(.key=="keywords") | .value.updatedAt // empty')
+          req=$(echo "$set" | jq -r '.[] | select(.key=="scan_request") | .value.requestedAt // empty')
+
+          now=$(date -u +%s)
+          lastS=0; [ -n "$last" ] && lastS=$(date -u -d "$last" +%s)
+          reqS=0;  [ -n "$req" ]  && reqS=$(date -u -d "$req" +%s)
+          hourTR=$(TZ=Europe/Istanbul date +%-H)
+          morning=$(TZ=Europe/Istanbul date -d "today 07:45" +%s)
+
+          if   [ "$lastS" -eq 0 ];                                                   then out true "ilk tarama"
+          elif [ "$reqS" -gt "$lastS" ];                                             then out true "panelden Şimdi tara isteği"
+          elif [ -n "$kwNow" ] && [ "$kwNow" != "$kwUsed" ];                         then out true "anahtar kelimeler değişti"
+          elif [ "$hourTR" -ge 8 ] && [ "$lastS" -lt "$morning" ];                   then out true "sabah taraması"
+          elif [ "$hourTR" -ge 8 ] && [ "$hourTR" -lt 20 ] && [ $((now - lastS)) -ge 10800 ]; then out true "3 saatlik periyodik tarama"
+          else out false "gerek yok (son tarama: $last)"
+          fi
+
+  tara:
+    needs: kontrol
+    if: needs.kontrol.outputs.run == 'true'
+    runs-on: windows-latest     # betik Windows PowerShell 5.1 ile yazıldı; public repoda ücretsiz
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: İlan önbelleğini geri yükle
+        uses: actions/cache@v4
+        with:
+          path: scraper/cache
+          key: ilan-cache-${{ github.run_id }}
+          restore-keys: ilan-cache-
+
+      - name: Tara ve Supabase'e yükle (${{ needs.kontrol.outputs.reason }})
+        shell: powershell
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          tzutil /s "Turkey Standard Time"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scraper\Update-TenderRadar.ps1 -Cloud
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tarama günlüğü
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarama-gunlugu
+          path: scraper/logs/
+          retention-days: 7

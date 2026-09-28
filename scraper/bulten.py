@@ -98,7 +98,8 @@ SECTIONS = [
     ("KAPSAM DIŞI DÜZELTME", "kd_duzeltme"), ("KAPSAM DIŞI ZEYİLNAME", "kd_duzeltme"), ("KAPSAM DIŞI SA", "kd_satis"),
     ("KAPSAM DIŞI İHALE", "kapsamdisi"), ("İHALE İLANLARI", "ilan"),
 ]
-RX_SEC = re.compile(r"^\s*(?:[A-Z]-\s*)?\d+\.\s+([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ \-]+İLAN|[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ \-]*(?:ZEYİLNAME|İLANLARI|İLANI))")
+# Bölüm başlığı satırı: "2. İHALE İLANLARI", "4. İSTİSNA İPTAL İLANLARI" … (satırın tamamı büyük harf)
+RX_SEC = re.compile(r"^\s*(?:[A-Z]-\s*)?\d+\.\s+([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ \-]{5,}?)\s*$")
 RX_ITEM = re.compile(r"^\s*(\d+)\.\s+(\d{4}/\d{3,})\s+(.+?)\s*$")
 RX_NOISE = re.compile(r"^\s*(KAMU İHALE BÜLTENİ|Kamu İhale Kurumu\s*[–-]|[A-ZÇĞİÖŞÜ ]+ İHALELERİ BÜLTENİ\s*$|\d+\s*$)")
 TR_UP = str.maketrans("abcçdefgğhıijklmnoöprsştuüvyzqwx", "ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZQWX")

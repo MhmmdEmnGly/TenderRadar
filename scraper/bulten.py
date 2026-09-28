@@ -222,7 +222,21 @@ def notice(title, msg, level="notice"):
 
 
 # ------------------------------------------------------------------ Çalıştır
+def table_ready():
+    try:
+        sb("GET", "bulten_ilan?select=ikn&limit=1")
+        return True
+    except RuntimeError as e:
+        if "404" in str(e) or "42P01" in str(e) or "PGRST205" in str(e):
+            return False
+        raise
+
+
 def run(backfill):
+    if not os.environ.get("SUPABASE_URL") or not os.environ.get("SUPABASE_SERVICE_KEY"):
+        notice("Kamu İhale Bülteni", "Supabase secret'ları tanımlı değil — atlandı", "warning"); return
+    if not table_ready():
+        notice("Kamu İhale Bülteni", "bulten_ilan tablosu yok — Supabase'de supabase/guncelleme-3.sql çalıştırılmalı (atlandı)", "warning"); return
     now = dt.datetime.now(TZ)
     today = now.date()
     pos, neg = keywords()

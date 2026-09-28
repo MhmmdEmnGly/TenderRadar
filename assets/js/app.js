@@ -66,6 +66,7 @@
     param: null,
     custFilter: store.get("custFilter", { seg: "", pinned: false, sort: "active" }),
     instFilter: store.get("instFilter", { il: "", seg: "", top: 7 }),
+    outFilter: { code: "" },
     mapFilter: store.get("mapFilter", { metric: "active", seg: "", sel: null }),
     showAddCustomer: false,
     dealSort: { key: "date", dir: -1 }
@@ -223,6 +224,63 @@
       m.addEventListener("click", (e) => { const b = e.target.closest("[data-m]"); if (b) done(b.dataset.m === "yes"); else if (e.target === m) done(false); });
       m.querySelector('[data-m="no"]').focus();
     });
+  }
+
+  // ---------- Kamu İhale Bülteni + elle girilen sonuçlar ----------
+  const BULTEN = DATA.bulten || { relevant: [], events: [], meta: null, ready: false };
+  const TUR_LABEL = { "Mal": "Mal Alımı", "Yapım": "Yapım İşi", "Hizmet": "Kiralama ve Hizmet Alımı", "Danışmanlık": "Danışmanlık Hizmet Alımı" };
+  const TOPIC_MAP = [["SCADA", /scada|rtu|telekontrol|adms|oms|uzaktan kumanda/i], ["Otomasyon", /otomasyon|plc|dcs|hmi|kontrol sistemi/i],
+    ["Enerji Dağıtım", /dağıtım merkezi|trafo merkezi|kompanzasyon|og hücre|fider/i], ["Telemetri / İzleme", /telemetri|izleme|enerji yönetim/i],
+    ["OSOS / Akıllı Sayaç", /akıllı sayaç|osos/i], ["Koruma", /61850|röle/i]];
+  const ekapLink = (ikn) => `https://ekapv2.kik.gov.tr/ekap/search/${String(ikn).replace("/", "_")}`;
+  function mergeBulten() {
+    const byIkn = new Map(tenders.filter((t) => t.ikn).map((t) => [t.ikn, t]));
+    const latest = new Map();
+    BULTEN.relevant.filter((r) => r.sec === "ilan" && r.ihale_tarihi).forEach((r) => {
+      const p = latest.get(r.ikn); if (!p || p.bulten_tarihi < r.bulten_tarihi) latest.set(r.ikn, r);
+    });
+    latest.forEach((r, ikn) => {
+      if (byIkn.has(ikn)) { byIkn.get(ikn).bultenDate = r.bulten_tarihi; return; }
+      const topicText = `${r.is_adi} ${r.nitelik || ""} ${(r.kw || []).join(" ")}`;
+      const t = {
+        id: "kik-" + ikn, ikn, refNo: ikn, title: r.is_adi, summary: r.nitelik || r.is_adi, authority: titleTR(r.idare || ""),
+        sourceType: "EKAP", sourceName: "Kamu İhale Bülteni (KİK)", city: r.il, tenderDate: r.ihale_tarihi, dateKind: "İhale tarihi", timeKnown: true,
+        procedure: [r.usul ? `${r.usul} ihale` : null, TUR_LABEL[r.tur]].filter(Boolean).join(" · "),
+        categories: [...TOPIC_MAP.filter(([, re]) => re.test(topicText)).map(([k]) => k), TUR_LABEL[r.tur]].filter(Boolean),
+        matched: r.kw || [], url: ekapLink(ikn), ekapUrl: ekapLink(ikn), firstSeen: `${r.bulten_tarihi}T08:00:00+03:00`, bultenDate: r.bulten_tarihi
+      };
+      tenders.push(t); byIkn.set(ikn, t);
+    });
+    BULTEN.events.forEach((ev) => {
+      const t = byIkn.get(ev.ikn); if (!t) return;
+      if (ev.sec === "iptal") { t.isCancelled = true; t.cancelDate = ev.bulten_tarihi; }
+      else if (ev.sec === "duzeltme") { t.isAddendum = true; t.correctedAt = ev.bulten_tarihi; }
+    });
+  }
+  // Elle girilen sonuçlar (EKAP'ta görülen): prefs.results[anahtar] → sözleşme kaydı olarak analizlere katılır
+  const resultKey = (t) => t.ikn || t.id;
+  function manualResults() { return (store.get("prefs", {}) || {}).results || {}; }
+  function manualDeal(key, r) {
+    return { id: "m-" + key, winner: r.winner, client: r.authority, subject: r.title, amount: r.amount ? { amount: r.amount, currency: "TRY" } : null,
+      estimate: r.estimate ? { amount: r.estimate, currency: "TRY" } : null, bidders: r.bidders || null, date: r.contractDate || r.date || r.at,
+      source: "Elle girildi (EKAP)", url: r.ikn ? ekapLink(r.ikn) : "#", ekapUrl: r.ikn ? ekapLink(r.ikn) : null, ikn: r.ikn || null,
+      sector: r.sector || "Otomasyon / SCADA", type: "İhale sonucu", manual: true };
+  }
+  function mergeManualResults() {
+    for (let i = deals.length - 1; i >= 0; i--) if (deals[i].manual) deals.splice(i, 1);
+    Object.entries(manualResults()).forEach(([k, r]) => { if (r && r.winner) deals.push(manualDeal(k, r)); });
+  }
+  // Tarihi geçmiş ihale için sonuç çıkarımı
+  function outcomeOf(t) {
+    const m = manualResults()[resultKey(t)];
+    if (m && m.winner) return { code: "done", label: "Sonuçlandı", detail: `${m.winner}${m.amount ? " · " + fmtMoney({ amount: m.amount, currency: "TRY" }) : ""}`, source: "elle girildi" };
+    const d = t.ikn ? deals.find((x) => x.ikn === t.ikn && !x.manual) : null;
+    if (d) return { code: "done", label: "Sonuçlandı", detail: `${d.winner}${d.amount ? " · " + fmtMoney(d.amount) : ""}`, source: d.source, url: d.url };
+    if (t.isCancelled) return { code: "cancel", label: "İptal edildi", detail: t.cancelDate ? `İptal ilanı: ${fmtDate(t.cancelDate + "T12:00:00", false)}` : "İptal ilanı yayımlandı", source: t.cancelDate ? "Kamu İhale Bülteni" : "ilan.gov.tr" };
+    const since = -daysLeft(t.tenderDate);
+    if (since < 0) return { code: "open", label: "Açık", detail: countdown(t.tenderDate) };
+    if (since < 45) return { code: "wait", label: "Değerlendirme / sözleşme aşaması", detail: `İhaleden ${Math.floor(since)} gün geçti · sözleşme genelde 30–60 gün içinde imzalanır` };
+    return { code: "check", label: "Sonuç yayımlanmış olmalı", detail: `İhaleden ${Math.floor(since)} gün geçti · sonucu EKAP'ta kontrol et` };
   }
 
   function filteredTenders() {
@@ -734,7 +792,9 @@
           <select data-inst="top">${[7, 10, 15, 20].map((n) => `<option value="${n}" ${(f.top || 7) === n ? "selected" : ""}>İlk ${n} kurum</option>`).join("")}</select>
           <span class="muted small">${scoped.length} kurum</span>
         </div>
-        <h2 class="section-title">İlk ${top.length} kurum${f.il ? " — " + esc(f.il) : ""}</h2>
+        <h2 class="section-title">Resmî bülten: en çok ihaleye çıkan kurumlar${f.il ? " — " + esc(f.il) : ""}</h2>
+        <div class="card table-wrap" id="bultenInst"><p class="muted small" style="padding:14px">${BULTEN.ready ? "Yükleniyor…" : "Kamu İhale Bülteni verisi henüz yok — Supabase'de <code>supabase/guncelleme-3.sql</code> çalıştırılınca ve ilk tarama bitince burada tüm kurumların (tüm alım türleri) ihale istatistikleri görünür."}</p></div>
+        <h2 class="section-title">İlk ${top.length} kurum${f.il ? " — " + esc(f.il) : ""} (ilgili ihaleler + bilinen sözleşmeler)</h2>
         <div class="inst-grid">${top.map(card).join("") || `<p class="muted">Bu filtrede kurum yok.</p>`}</div>
 
         <h2 class="section-title">İl bazında en çok bütçeli / en aktif kurumlar</h2>
@@ -754,6 +814,67 @@
             <td><a href="#/rakip/${encodeURIComponent(p.winner)}">${esc(p.winner)}</a></td><td class="num">${p.n}</td>
             <td class="num">${p.total >= 1 ? esc(fmtMoney({ amount: p.total, currency: "TRY" })) : "—"}</td></tr>`).join("") || `<tr><td colspan="4" class="muted">Henüz sözleşme verisi yok.</td></tr>`}</tbody>
         </table></div>`;
+    },
+
+    sonuc() {
+      const f = state.outFilter;
+      const past = tenders
+        .filter((t) => daysLeft(t.tenderDate) < 0 && daysLeft(t.tenderDate) > -120 && relevance(t).score >= 0)
+        .map((t) => ({ ...t, out: outcomeOf(t) }))
+        .filter((t) => !f.code || t.out.code === f.code)
+        .filter((t) => matchesQuery(t, ["title", "authority", "ikn", "city"]))
+        .sort((a, b) => new Date(b.tenderDate) - new Date(a.tenderDate));
+      const allPast = tenders.filter((t) => daysLeft(t.tenderDate) < 0 && daysLeft(t.tenderDate) > -120).map((t) => ({ ...t, out: outcomeOf(t) }));
+      const cnt = (c) => allPast.filter((t) => t.out.code === c).length;
+      const known = deals.filter((x) => x.ikn || x.manual);
+      const disc = known.map(discountOf).filter((v) => v != null);
+      const bids = known.map((x) => x.bidders).filter((v) => v != null);
+      // Kurum bazında iptal oranı (bülten + ilan.gov.tr, en az 2 ihale)
+      const byInst = new Map();
+      allPast.forEach((t) => { const k = t.authority; const r = byInst.get(k) || { n: 0, c: 0 }; r.n++; if (t.out.code === "cancel") r.c++; byInst.set(k, r); });
+      const cancelRank = [...byInst.entries()].filter(([, r]) => r.n >= 2 && r.c).sort((a, b) => b[1].c / b[1].n - a[1].c / a[1].n).slice(0, 8);
+      const badge = { cancel: "warn", done: "status", wait: "", check: "new", open: "" };
+      const chip = (code, label) => `<button class="chip ${f.code === code ? "on" : ""}" data-outf="${code}" type="button">${label}</button>`;
+      return `
+        <div class="page-head"><div><h1>Sonuç Takibi</h1><p>Tarihi geçen ilgili ihalelerin durumu: iptal mi oldu, kim aldı, kaça aldı? Bulunamayan sonuçları EKAP'ta görüp buraya girebilirsin.</p></div></div>
+        ${statTiles([["Son 120 gün", fmtNum(allPast.length), "tarihi geçen ihale"], ["İptal", fmtNum(cnt("cancel")), allPast.length ? "%" + fmtNum((cnt("cancel") / allPast.length) * 100, 0) + " iptal oranı" : ""],
+          ["Sonucu bilinen", fmtNum(cnt("done")), "bülten, haber veya elle"], ["Bekleyen / kontrol", fmtNum(cnt("wait") + cnt("check")), `${cnt("check")} tanesi EKAP'ta kontrol edilmeli`],
+          ["Ort. kırım (bilinen)", disc.length ? "%" + fmtNum(disc.reduce((a, b) => a + b, 0) / disc.length, 1) : "—", `${disc.length} sözleşme`],
+          ["Ort. teklif sayısı", bids.length ? fmtNum(bids.reduce((a, b) => a + b, 0) / bids.length, 1) : "—", "rekabet düzeyi"]])}
+        <div class="filters" style="margin-top:16px">${chip("", "Tümü")}${chip("wait", "Değerlendirmede")}${chip("check", "Kontrol edilmeli")}${chip("done", "Sonuçlandı")}${chip("cancel", "İptal")}</div>
+        <div class="card table-wrap"><table>
+          <thead><tr><th>İhale tarihi</th><th>İhale</th><th>İdare</th><th>Durum</th><th>Ayrıntı</th><th></th></tr></thead>
+          <tbody>${past.map((t) => `<tr>
+            <td class="small">${esc(fmtDate(t.tenderDate, false))}</td>
+            <td><a href="javascript:void 0" data-open="${esc(t.id)}">${esc(t.title)}</a><div class="muted small">${esc(t.ikn || t.refNo || "")}${t.city ? " · " + esc(t.city) : ""}</div></td>
+            <td class="small">${esc(t.authority)}</td>
+            <td><span class="badge ${badge[t.out.code]}">${esc(t.out.label)}</span></td>
+            <td class="small">${esc(t.out.detail)}${t.out.source ? `<div class="muted">${t.out.url ? `<a href="${esc(t.out.url)}" target="_blank" rel="noopener">${esc(t.out.source)} ↗</a>` : esc(t.out.source)}</div>` : ""}</td>
+            <td class="small" style="white-space:nowrap">${t.ekapUrl ? `<a class="btn small" href="${esc(t.ekapUrl)}" target="_blank" rel="noopener">EKAP ↗</a> ` : ""}
+              ${t.out.code !== "cancel" ? `<button class="btn small" data-result="${esc(t.id)}" type="button">${t.out.code === "done" && manualResults()[resultKey(t)] ? "Düzenle" : "Sonucu gir"}</button>` : ""}</td></tr>`).join("")
+            || `<tr><td colspan="6" class="muted">Bu filtrede ihale yok.</td></tr>`}</tbody>
+        </table></div>
+        <div class="grid two-col" style="margin-top:16px">
+          <div class="card card-pad"><h3>En çok iptal eden kurumlar (son 120 gün)</h3>
+            ${barList(cancelRank.map(([k, r]) => [k, Math.round((r.c / r.n) * 100), `${k}: ${r.c}/${r.n} ihale iptal`]), (v) => "%" + v)}</div>
+          <div class="card card-pad"><h3>Çıkarım nasıl yapılıyor?</h3>
+            <ul class="small" style="margin:0;padding-left:18px;line-height:1.7">
+              <li><b>İptal:</b> Kamu İhale Bülteni'nde (veya ilan.gov.tr'de) iptal ilanı yayımlandıysa.</li>
+              <li><b>Sonuçlandı:</b> aynı İKN'li sözleşme Yatırımlar Dergisi'nde haber olduysa ya da sen elle girdiysen.</li>
+              <li><b>Değerlendirmede:</b> ihaleden 45 günden az geçtiyse (sözleşme genelde 30–60 günde imzalanır).</li>
+              <li><b>Kontrol edilmeli:</b> 45 günden fazla geçti ama sonuç bilgisi yok — EKAP'ta sonuç ilanına bak, "Sonucu gir" ile ekle.</li>
+            </ul>
+            <p class="muted small" style="margin:8px 0 0">Elle girdiğin sonuçlar Rakip Analizi ve Kurum Analitiği'ne otomatik eklenir.</p></div>
+        </div>`;
+    },
+
+    kurum() {
+      const name = state.param;
+      const c = customers().find((x) => trUpper(x.name) === trUpper(name) || customerKey(x.name) === customerKey(name));
+      return `
+        <div class="page-head"><div><a class="small" href="#/kurumlar">← Kurum analitiği</a><h1 style="margin-top:6px">${esc(titleTR(name))}</h1>
+          <p>Kamu İhale Bülteni'ndeki tüm ihaleleri (tüm alım türleri) ${c ? ` · <a href="#/musteri/${encodeURIComponent(c.key)}">müşteri kartı →</a>` : ""}</p></div></div>
+        <div id="kurumDetail"><p class="muted">Bülten verisi yükleniyor…</p></div>`;
     },
 
     harita() {
@@ -1008,6 +1129,28 @@
           ${DATA.generatedAt ? `<br>Son güncelleme: <b>${esc(fmtDate(DATA.generatedAt))}</b> (${esc(relDate(DATA.generatedAt))}).` : ""}
           ${DATA.generatedAt && Date.now() - new Date(DATA.generatedAt) > 26 * 3600000 ? `<br><b style="color:var(--urgent)">Veri 1 günden eski — güncellemeyi çalıştır.</b>` : ""}</p>
         </div>
+        <div class="card card-pad" style="margin-bottom:16px">
+          <h3>Kamu İhale Bülteni (KİK)</h3>
+          <p class="small" style="margin:0">${BULTEN.ready
+            ? `✅ Bağlı. Her taramada günün Mal / Yapım / Hizmet / Danışmanlık bültenleri ve arşivden 10 iş günü işlenir: tüm ihale ilanları, iptal ve düzeltme ilanları. ${esc(bultenNote())}`
+            : `⏳ Kurulum bekleniyor: Supabase'de <code>supabase/guncelleme-3.sql</code> çalıştırılınca bir sonraki taramada başlar.`}
+            Kaynak: <a href="https://ekap.kik.gov.tr/ekap/ilan/bultenindirme.aspx" target="_blank" rel="noopener">ekap.kik.gov.tr → Kamu İhale Bülteni</a></p>
+        </div>
+        <div class="card card-pad" style="margin-bottom:16px">
+          <h3>Toplanamayan veriler ve nedenleri</h3>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Veri</th><th>Neden toplanamıyor</th><th>Yerine ne yapılıyor</th></tr></thead>
+            <tbody>
+              <tr><td><b>Tüm ihalelerin sözleşme bedeli ve yüklenicisi</b></td><td class="small">Sonuç ilanları yalnızca EKAP'ta; EKAP otomatik erişime karşı insan doğrulaması (Cloudflare) kullanıyor. Bültende sonuç ilanı yayımlanmıyor.</td>
+                <td class="small">Yatırımlar Dergisi haberleri + <a href="#/sonuc">Sonuç Takibi</a>'nde EKAP'ta gördüğün sonucu elle girme; iptaller bültenden otomatik.</td></tr>
+              <tr><td><b>Yaklaşık maliyet</b></td><td class="small">4734'e göre ihale öncesi gizli; yalnızca sonuç ilanında (EKAP) açıklanır.</td><td class="small">Sonucu bilinen ihalelerden kırım oranı hesaplanır.</td></tr>
+              <tr><td><b>Teklif veren firmalar ve teklif tutarları</b></td><td class="small">Kamuya açıklanmaz (yalnızca ihaleye katılanlar görür).</td><td class="small">Sonuç ilanındaki teklif sayısı (bilinenlerde) rekabet göstergesi olarak kullanılır.</td></tr>
+              <tr><td><b>Doküman indiren firmalar</b></td><td class="small">EKAP'ta yalnızca giriş yapmış isteklilere açık.</td><td class="small">—</td></tr>
+              <tr><td><b>EDAŞ ihale sonuçları</b></td><td class="small">EDAŞ'lar özel şirket; 4734'e tabi değil, sonuç yayımlama zorunluluğu yok.</td><td class="small">İlanlar ilan.gov.tr'den; sonuçlar yalnızca basında çıkarsa (Yatırımlar Dergisi).</td></tr>
+              <tr><td><b>Özel sektör RFQ'ları</b></td><td class="small">Kamuya ilan edilmez (davetle).</td><td class="small">Müşteri kartları ve takip listesiyle elle yönetim.</td></tr>
+              <tr><td><b>ilan.gov.tr geçmişi</b></td><td class="small">Portal yalnızca yayındaki ilanları verir.</td><td class="small">Her taramada biriken geçmiş + bülten arşivi (12 aya kadar).</td></tr>
+            </tbody></table></div>
+        </div>
         ${CLOUD ? `<div class="card card-pad" style="margin-bottom:16px">
           <h3>Yerel geçmişi buluta aktar</h3>
           <p class="small" style="margin:0 0 8px">Bilgisayardaki yerel sürümün geçmişini (ihaleler, haberler, sözleşmeler) buluttakiyle birleştirir; aynı kayıt iki kez eklenmez.
@@ -1242,6 +1385,116 @@
         <div class="meta">${esc(t.authority)} · <b style="color:var(--${t.bucket})">${esc(countdown(t.tenderDate))}</b></div></div></div>`).join("") || `<p class="muted small">Aktif ihale yok.</p>`}`;
   }
 
+  // ---------- Kamu İhale Bülteni: kurum tablosu ve kurum detayı (görünümlerden, gerektiğinde yüklenir) ----------
+  const bultenNote = () => BULTEN.meta ? `Bülten arşivi: ${BULTEN.meta.dayCount} iş günü (${BULTEN.meta.oldest ? fmtDate(BULTEN.meta.oldest + "T12:00:00", false) : "—"} → ${BULTEN.meta.newest ? fmtDate(BULTEN.meta.newest + "T12:00:00", false) : "—"}); her taramada 10 gün geriye doğru dolar.` : "";
+  async function loadBultenInst() {
+    const el = $("#bultenInst"); if (!el || !CLOUD || !BULTEN.ready) return;
+    const f = state.instFilter;
+    let q = CLOUD.from("bulten_idare_ozet").select("*").order("ilgili", { ascending: false }).order("ihale", { ascending: false }).limit(40);
+    if (f.il) q = q.eq("il", f.il);
+    const { data, error } = await q;
+    if (!$("#bultenInst")) return;
+    if (error) { el.innerHTML = `<p class="muted small" style="padding:14px">Bülten verisi okunamadı: ${esc(error.message)}</p>`; return; }
+    const rows = data || [];
+    el.innerHTML = `<table><thead><tr><th>Kurum</th><th>İl</th><th>İlgili ihale</th><th>Toplam ihale</th><th>Mal / Yapım / Hizmet / Danış.</th><th>İptal oranı</th><th>e-ihale</th><th>Dönem</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr>
+        <td><a href="#/kurum/${encodeURIComponent(r.idare)}">${esc(titleTR(r.idare))}</a></td><td class="small">${esc(r.il || "—")}</td>
+        <td class="num"><b>${r.ilgili}</b></td><td class="num">${r.ihale}</td>
+        <td class="small">${r.mal} / ${r.yapim} / ${r.hizmet} / ${r.danismanlik}</td>
+        <td class="num">${r.ihale ? "%" + fmtNum((r.iptal / r.ihale) * 100, 0) : "—"}</td>
+        <td class="num">${r.ihale ? "%" + fmtNum((r.eihale / r.ihale) * 100, 0) : "—"}</td>
+        <td class="small">${esc(fmtDate(r.ilk + "T12:00:00", false))} → ${esc(fmtDate(r.son + "T12:00:00", false))}</td></tr>`).join("") || `<tr><td colspan="8" class="muted">Henüz kayıt yok (ilk bülten taraması bekleniyor).</td></tr>`}</tbody></table>
+      <p class="muted small" style="padding:0 14px 12px">${esc(bultenNote())} Sıralama: anahtar kelimelerine uyan ihale sayısı, sonra toplam ihale.</p>`;
+  }
+  async function loadKurumDetail() {
+    const el = $("#kurumDetail"); if (!el) return;
+    if (!CLOUD || !BULTEN.ready) { el.innerHTML = `<p class="muted">Kamu İhale Bülteni verisi yok (guncelleme-3.sql kurulmalı).</p>`; return; }
+    const name = state.param;
+    const [oz, ay, ilanlar] = await Promise.all([
+      CLOUD.from("bulten_idare_ozet").select("*").eq("idare", name).maybeSingle(),
+      CLOUD.from("bulten_aylik").select("ay,tur,adet,ilgili").eq("idare", name),
+      CLOUD.from("bulten_ilan").select("ikn,sec,bulten_tarihi,tur,is_adi,nitelik,ihale_tarihi,usul,ilgili,kw").eq("idare", name).order("bulten_tarihi", { ascending: false }).limit(80)
+    ]);
+    if (!$("#kurumDetail")) return;
+    const o = oz.data;
+    if (!o) { el.innerHTML = `<p class="muted">Bu kurum için bülten kaydı bulunamadı.</p>`; return; }
+    const months = lastMonths(12);
+    const rowsAy = ay.data || [];
+    const monthly = months.map((m) => { const v = rowsAy.filter((r) => String(r.ay).slice(0, 7) === m); const n = v.reduce((a, r) => a + r.adet, 0); const g = v.reduce((a, r) => a + r.ilgili, 0);
+      return { key: m, label: monthLabel(m), value: n, tip: `${monthLabel(m)}: ${n} ihale (${g} ilgili)` }; });
+    const byMonthRel = months.map((m) => ({ key: m, label: monthLabel(m), value: rowsAy.filter((r) => String(r.ay).slice(0, 7) === m).reduce((a, r) => a + r.ilgili, 0) }));
+    const list = ilanlar.data || [];
+    const kwCount = countBy(list.filter((r) => r.ilgili).flatMap((r) => r.kw || []), (x) => x);
+    // Aktif olduğu aylar (tahmin için): en çok ihale açtığı 3 ay (takvim ayı)
+    const moName = (i) => new Date(2026, i, 15).toLocaleDateString("tr-TR", { month: "long" });
+    const byCalMonth = Array.from({ length: 12 }, (_, i) => rowsAy.filter((r) => new Date(r.ay).getMonth() === i).reduce((a, r) => a + r.adet, 0));
+    const peak = byCalMonth.map((v, i) => [i, v]).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([i]) => moName(i));
+    const known = deals.filter((x) => x.client && clientMatches({ key: customerKey(name) }, x.client));
+    el.innerHTML = `
+      ${statTiles([["Toplam ihale", fmtNum(o.ihale), `${fmtDate(o.ilk + "T12:00:00", false)} → ${fmtDate(o.son + "T12:00:00", false)}`], ["İlgili ihale", fmtNum(o.ilgili), "anahtar kelimelerine uyan"],
+        ["İptal oranı", o.ihale ? "%" + fmtNum((o.iptal / o.ihale) * 100, 0) : "—", `${o.iptal} iptal · ${o.duzeltme} düzeltme`], ["e-ihale", o.ihale ? "%" + fmtNum((o.eihale / o.ihale) * 100, 0) : "—"],
+        ["En yoğun aylar", peak.length ? peak.join(", ") : "—", "bülten arşivine göre"]])}
+      <div class="grid two-col" style="margin-top:16px">
+        <div class="card card-pad"><h4 class="chart-title">Aylık ihale sayısı (tüm türler)</h4>${columnChart(monthly, (v) => `${v} ihale`)}</div>
+        <div class="card card-pad"><h4 class="chart-title">Aylık ilgili ihale</h4>${columnChart(byMonthRel, (v) => `${v} ilgili ihale`)}</div>
+        <div class="card card-pad"><h4 class="chart-title">Alım türleri</h4>${barList([["Mal", o.mal], ["Yapım", o.yapim], ["Hizmet", o.hizmet], ["Danışmanlık", o.danismanlik]].filter(([, v]) => v), (v) => `${v} ihale`)}</div>
+        <div class="card card-pad"><h4 class="chart-title">İlgilendiği konular (anahtar kelimeler)</h4>${barList(kwCount.slice(0, 8), (v) => `${v} ihale`)}</div>
+      </div>
+      <div class="card card-pad" style="margin-top:16px"><h3>Bilinen sözleşmeler <span class="muted small">${known.length}</span></h3>
+        ${known.map((x) => `<div class="list-item"><div><h4 style="font-weight:500">${esc(x.subject)}</h4><div class="meta"><a href="#/rakip/${encodeURIComponent(x.winner)}">${esc(x.winner)}</a> · ${esc(fmtMoney(x.amount))} · ${esc(fmtDate(x.date, false))} · ${esc(x.source)}</div></div></div>`).join("")
+          || `<p class="muted small">Bu kurumun sonucu bilinen ihalesi yok. Sonuç Takibi sayfasından EKAP'ta gördüğün sonuçları girebilirsin.</p>`}</div>
+      <div class="card table-wrap" style="margin-top:16px"><table>
+        <thead><tr><th>Bülten</th><th>Tür</th><th>İlan</th><th>İş</th><th>İhale tarihi</th><th></th></tr></thead>
+        <tbody>${list.map((r) => `<tr class="${r.ilgili ? "row-hl" : ""}"><td class="small">${esc(fmtDate(r.bulten_tarihi + "T12:00:00", false))}</td><td class="small">${esc(r.tur || "")}</td>
+          <td class="small">${esc({ ilan: "İhale", iptal: "İptal", duzeltme: "Düzeltme", on: "Ön ilan" }[r.sec] || r.sec)}</td>
+          <td>${esc(r.is_adi || "")}${r.ilgili ? ` <span class="tag">${esc((r.kw || []).join(", "))}</span>` : ""}<div class="muted small">${esc((r.nitelik || "").slice(0, 160))}</div></td>
+          <td class="small">${r.ihale_tarihi ? esc(fmtDate(r.ihale_tarihi, false)) : "—"}</td>
+          <td class="small"><a href="${esc(ekapLink(r.ikn))}" target="_blank" rel="noopener">EKAP ↗</a></td></tr>`).join("")}</tbody></table>
+        <p class="muted small" style="padding:0 14px 12px">Son 80 bülten kaydı. Vurgulu satırlar anahtar kelimelerine uyanlar. ${esc(bultenNote())}</p></div>`;
+  }
+
+  // ---------- Sonucu elle gir (EKAP'ta görülen) ----------
+  function openResultForm(t) {
+    const key = resultKey(t); const cur = manualResults()[key] || {};
+    const m = document.createElement("div");
+    m.className = "modal-backdrop";
+    m.innerHTML = `<form class="modal" data-result-form>
+      <h3>İhale sonucunu gir</h3>
+      <p class="small" style="margin:0 0 4px"><b>${esc(t.title)}</b></p><p class="muted small" style="margin:0 0 12px">${esc(t.authority)} · ${esc(t.ikn || "")}
+        ${t.ekapUrl ? ` · <a href="${esc(t.ekapUrl)}" target="_blank" rel="noopener">EKAP'ta sonuç ilanını aç ↗</a>` : ""}</p>
+      <div class="stack">
+        <label class="small">Yüklenici (kazanan firma) *<input class="input full" name="winner" required value="${esc(cur.winner || "")}"></label>
+        <div class="form-row">
+          <label class="small" style="flex:1">Sözleşme bedeli (₺)<input class="input full" name="amount" inputmode="decimal" value="${cur.amount ? esc(String(cur.amount)) : ""}" placeholder="ör. 12.450.000"></label>
+          <label class="small" style="flex:1">Yaklaşık maliyet (₺)<input class="input full" name="estimate" inputmode="decimal" value="${cur.estimate ? esc(String(cur.estimate)) : ""}"></label>
+        </div>
+        <div class="form-row">
+          <label class="small" style="flex:1">Teklif sayısı<input class="input full" name="bidders" inputmode="numeric" value="${cur.bidders || ""}"></label>
+          <label class="small" style="flex:1">Sözleşme tarihi<input class="input full" type="date" name="contractDate" value="${esc(cur.contractDate || "")}"></label>
+        </div>
+      </div>
+      <div class="actions modal-actions">${cur.winner ? `<button class="btn ghost" data-m="delete" type="button">Sil</button>` : ""}<button class="btn" data-m="no" type="button">Vazgeç</button><button class="btn primary" type="submit">Kaydet</button></div>
+    </form>`;
+    document.body.appendChild(m);
+    const close = () => m.remove();
+    const num = (v) => { const s = String(v || "").replace(/\./g, "").replace(",", ".").replace(/[^\d.]/g, ""); return s ? Number(s) : null; };
+    m.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-m]");
+      if (e.target === m || (b && b.dataset.m === "no")) close();
+      if (b && b.dataset.m === "delete") { const p = prefs(); const r = { ...(p.results || {}) }; delete r[key]; p.results = r; savePrefs(p); mergeManualResults(); invalidateCustomers(); close(); render(); toast("Sonuç silindi"); }
+    });
+    m.querySelector("form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const p = prefs(); p.results = { ...(p.results || {}) };
+      p.results[key] = { winner: String(fd.get("winner")).trim(), amount: num(fd.get("amount")), estimate: num(fd.get("estimate")), bidders: num(fd.get("bidders")),
+        contractDate: fd.get("contractDate") || null, ikn: t.ikn || null, title: t.title, authority: t.authority, date: t.tenderDate, at: new Date().toISOString(),
+        sector: (t.categories || []).some((c) => /SCADA|Otomasyon|Telemetri|Koruma/.test(c)) ? "Otomasyon / SCADA" : (t.categories || []).includes("Enerji Dağıtım") ? "Enerji Dağıtım / İletim" : "Diğer" };
+      savePrefs(p); mergeManualResults(); invalidateCustomers(); close(); render(); toast("Sonuç kaydedildi — Rakip Analizi ve Kurum Analitiği güncellendi");
+    });
+    m.querySelector('input[name="winner"]').focus();
+  }
+
   // E-posta günlüğü: Anahtar Kelimeler sayfasında son gönderim bilgisi
   function loadMailLog() {
     if (!CLOUD) return;
@@ -1293,6 +1546,8 @@
       <div class="d-body">
         <div style="--c:var(--${t.bucket})"><div class="big-count">${esc(t.isCancelled ? "İhale iptal edildi" : countdown(t.tenderDate))}</div>
           <div class="muted small">${esc(t.dateKind || "İhale tarihi")}: ${esc(whenText(t))}</div></div>
+        ${daysLeft(t.tenderDate) < 0 ? (() => { const o = outcomeOf(t); return `<div class="summary-box" style="margin-top:12px"><b>Sonuç durumu</b>${esc(o.label)} — ${esc(o.detail)}${o.source ? ` <span class="muted">(${esc(o.source)})</span>` : ""}
+          ${o.code !== "cancel" ? `<div style="margin-top:8px"><button class="btn small" data-result="${esc(t.id)}" type="button">${manualResults()[resultKey(t)] ? "Sonucu düzenle" : "Sonucu gir"}</button></div>` : ""}</div>`; })() : ""}
         <div class="actions">
           ${t.ekapUrl ? `<a class="btn primary" href="${esc(t.ekapUrl)}" target="_blank" rel="noopener" title="EKAP güvenlik kontrolünü (Cloudflare) onayladıktan sonra ihale açılır">↗ EKAP'ta aç (İKN ${esc(t.ikn)})</a>` : ""}
           ${t.ilanUrl ? `<a class="btn ${t.ekapUrl ? "" : "primary"}" href="${esc(t.ilanUrl)}" target="_blank" rel="noopener">↗ İlanın tam metni (ilan.gov.tr)</a>` : ""}
@@ -1524,7 +1779,9 @@
     $("#view").innerHTML = views[v]();
     if (v === "harita") drawMap();
     if (v === "ayarlar") loadMailLog();
-    const navV = v === "musteri" ? "musteriler" : v === "rakip" ? "rakipler" : v;
+    if (v === "kurumlar") loadBultenInst();
+    if (v === "kurum") loadKurumDetail();
+    const navV = v === "musteri" ? "musteriler" : v === "rakip" ? "rakipler" : v === "kurum" ? "kurumlar" : v;
     document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navV));
   }
   function updateNavCounts() {
@@ -1553,8 +1810,10 @@
   document.addEventListener("click", (e) => {
     // Kart içindeki dış bağlantılar kartı açmasın, doğrudan kaynağa gitsin
     if (e.target.closest("a[href]") && !e.target.closest("[data-star],[data-action]")) return;
-    const el = e.target.closest("[data-star],[data-dismiss],[data-restore],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg],[data-prov]");
+    const el = e.target.closest("[data-star],[data-dismiss],[data-restore],[data-result],[data-outf],[data-open],[data-src],[data-action],[data-tab],[data-newstype],[data-sort],[data-go],[data-kw-del],[data-crm],[data-seg],[data-prov]");
     if (!el) return;
+    if (el.dataset.result) { e.stopPropagation(); const t = tenders.find((x) => x.id === el.dataset.result); if (t) openResultForm(t); return; }
+    if (el.dataset.outf !== undefined) { state.outFilter.code = el.dataset.outf; render(); return; }
     if (el.dataset.dismiss) {
       e.stopPropagation();
       const t = tenders.find((x) => x.id === el.dataset.dismiss);
@@ -1801,7 +2060,9 @@
   }
   if (DATA.generatedAt) $("#dataStamp").textContent = "Veri: " + fmtDate(DATA.generatedAt);
   window.addEventListener("hashchange", route);
-  purgeDismissed();   // tarihi 3 günden fazla geçmiş "çıkarılanlar" kaydını temizle
+  mergeBulten();          // Kamu İhale Bülteni ilanları + iptal/düzeltme işaretleri
+  mergeManualResults();   // elle girilen sonuçlar → sözleşme kayıtları
+  purgeDismissed();       // tarihi 3 günden fazla geçmiş "çıkarılanlar" kaydını temizle
   document.addEventListener("toggle", (e) => { if (e.target.matches && e.target.matches("[data-toggle-dismissed]")) state.openDismissed = e.target.open; }, true);
   updateNavCounts();
   route();
@@ -1813,6 +2074,8 @@
 
   // Geri sayımlar dakikada bir tazelenir (çekmece açıkken ve yazı yazarken dokunma)
   setInterval(() => {
+    // Geri sayım gerektirmeyen / uzaktan veri çeken sayfalar dakikalık yenilemeye girmez
+    if (["kurum", "kurumlar", "harita", "sonuc"].includes(state.view) || document.querySelector(".modal-backdrop")) return;
     if (!$("#drawer").classList.contains("open") && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) render();
   }, 60000);
 })();

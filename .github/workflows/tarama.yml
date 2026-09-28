@@ -81,6 +81,27 @@ jobs:
           else out false "gerek yok (son tarama: $last)"
           fi
 
+  bulten:
+    # Kamu İhale Bülteni: bugünün bültenleri + arşivden 10 iş günü (tam taramayla birlikte, paralel)
+    needs: kontrol
+    if: needs.kontrol.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    concurrency:
+      group: bulten
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pypdf requests
+      - name: Kamu İhale Bülteni
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scraper/bulten.py --backfill 10
+
   tara:
     needs: kontrol
     if: needs.kontrol.outputs.run == 'true'

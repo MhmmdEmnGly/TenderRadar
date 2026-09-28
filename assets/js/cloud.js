@@ -91,6 +91,25 @@
       keywords: by.sources?.data?.keywords || null
     };
 
+    // ---- Kamu İhale Bülteni (guncelleme-3.sql kuruluysa): ilgili ilanlar (son 150 gün) + mevcut ihalelerin iptal/düzeltme kayıtları
+    const bulten = { relevant: [], events: [], meta: null, ready: false };
+    try {
+      const since = new Date(Date.now() - 150 * 864e5).toISOString().slice(0, 10);
+      const [rel, meta] = await Promise.all([
+        sb.from("bulten_ilan").select("ikn,sec,bulten_tarihi,tur,idare,il,is_adi,nitelik,ihale_tarihi,usul,eihale,kw")
+          .eq("ilgili", true).gte("bulten_tarihi", since).order("bulten_tarihi", { ascending: false }).limit(3000),
+        sb.from("datasets").select("data").eq("key", "bulten_meta").maybeSingle()
+      ]);
+      if (!rel.error) { bulten.relevant = rel.data || []; bulten.ready = true; }
+      bulten.meta = meta.data ? meta.data.data : null;
+      const ikns = [...new Set([...(window.TR_DATA.tenders || []).map((t) => t.ikn), ...bulten.relevant.map((r) => r.ikn)].filter(Boolean))].slice(0, 300);
+      if (bulten.ready && ikns.length) {
+        const ev = await sb.from("bulten_ilan").select("ikn,sec,bulten_tarihi,ihale_tarihi").in("ikn", ikns).in("sec", ["iptal", "duzeltme"]);
+        if (!ev.error) bulten.events = ev.data || [];
+      }
+    } catch { /* tablo yoksa bülten verisi olmadan devam */ }
+    window.TR_DATA.bulten = bulten;
+
     // ---- Kullanıcı durumunu (crm, watch) Supabase'e senkronla: değişiklikten 700 ms sonra tek istek
     const pending = {};
     let timer = null;
@@ -141,6 +160,8 @@
         if (error) throw new Error(error.message);
         return data ? data.data : null;
       },
+      // Salt okunur sorgular (bülten görünümleri vb.): RLS yalnızca giriş yapmış kullanıcıya izin verir
+      from(table) { return sb.from(table); },
       async latestVersion() {
         const { data, error } = await sb.from("datasets").select("data,generated_at").eq("key", "version").maybeSingle();
         if (error || !data) return null;

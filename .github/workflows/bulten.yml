@@ -1,26 +1,30 @@
-name: Kamu İhale Bülteni
+name: Kamu İhale Bülteni (elle)
 
-# KİK'in herkese açık günlük bültenlerinden ihale sonuç ilanlarını toplar.
+# KİK'in herkese açık günlük bültenlerinden ilanları toplar. Normalde "Tarama" iş akışının içinde çalışır;
+# bu iş akışı elle çalıştırmak (ör. arşivi hızlı doldurmak) içindir.
 on:
   workflow_dispatch:
     inputs:
-      mod:
-        description: "probe = yapıyı incele"
+      backfill:
+        description: "Arşivden en fazla kaç iş günü işlensin"
         required: false
-        default: "probe"
-  push:
-    branches: [main]
-    paths:
-      - "scraper/bulten.py"
-      - ".github/workflows/bulten.yml"
+        default: "20"
+      probe:
+        description: "Yalnızca yapı testi (veri yazmaz)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: bulten
+  cancel-in-progress: false
+
 jobs:
   bulten:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,4 +32,9 @@ jobs:
           python-version: "3.12"
       - run: pip install --quiet pypdf requests
       - name: Bülten
-        run: python scraper/bulten.py --probe
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.probe }}" = "true" ]; then python scraper/bulten.py --probe
+          else python scraper/bulten.py --backfill "${{ github.event.inputs.backfill }}"; fi

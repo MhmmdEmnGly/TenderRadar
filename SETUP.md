@@ -42,6 +42,11 @@ Panel adresi: `https://<kullanıcı-adın>.github.io/<repo-adı>/`
 ## 5. Güncelleme 2 (geçmiş içe aktarma izni)
 Supabase → SQL Editor → `supabase/guncelleme-2.sql` dosyasını yapıştır → **Run**.
 
+## 5b. Güncelleme 3 (Kamu İhale Bülteni)
+Supabase → SQL Editor → `supabase/guncelleme-3.sql` → **Run**. KİK'in herkese açık günlük bültenlerindeki tüm ihale,
+iptal ve düzeltme ilanları bir sonraki taramadan itibaren toplanır (arşiv her taramada 10 iş günü geriye dolar;
+hızlı doldurmak için Actions → "Kamu İhale Bülteni (elle)" → Run workflow).
+
 ## 6. Yedek zamanlayıcı (önerilir)
 GitHub'ın kendi zamanlayıcısı yeni repolarda gecikebilir. Supabase her 10 dakikada bir taramayı "kontrol" modunda tetikler:
 1. GitHub → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**

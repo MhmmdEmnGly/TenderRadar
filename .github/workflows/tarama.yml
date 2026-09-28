@@ -34,7 +34,8 @@ jobs:
         run: |
           set -euo pipefail
           out() { echo "run=$1" >> "$GITHUB_OUTPUT"; echo "reason=$2" >> "$GITHUB_OUTPUT"; echo "Karar: $1 ($2)"; }
-          if [ -z "${SB_URL:-}" ] || [ -z "${SB_KEY:-}" ]; then echo "::error::SUPABASE_URL / SUPABASE_SERVICE_KEY secret'ları tanımlı değil (SETUP.md)"; exit 1; fi
+          # Kurulum bitmeden (secret'lar yokken) 10 dakikada bir hata e-postası gitmesin: sessizce atla
+          if [ -z "${SB_URL:-}" ] || [ -z "${SB_KEY:-}" ]; then echo "::warning::SUPABASE_URL / SUPABASE_SERVICE_KEY secret'ları henüz tanımlı değil (SETUP.md, adım 4) — tarama atlandı"; out false "kurulum bekleniyor"; exit 0; fi
           if [ "$EVENT" = "workflow_dispatch" ]; then out true "elle başlatıldı"; exit 0; fi
 
           q() { curl -fsS "$SB_URL/rest/v1/$1" -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY"; }

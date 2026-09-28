@@ -90,8 +90,15 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           tzutil /s "Turkey Standard Time"
-          powershell -NoProfile -ExecutionPolicy Bypass -File scraper\Update-TenderRadar.ps1 -Cloud
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          try {
+            & .\scraper\Update-TenderRadar.ps1 -Cloud
+          } catch {
+            # Hata metni "annotation" olarak da yazılır: Actions özet sayfasında (girişsiz) görünür
+            $pos = ($_.InvocationInfo.PositionMessage -replace "`r?`n", ' ') -replace '\s+', ' '
+            Write-Output "::error title=Tarama hatası::$($_.Exception.Message) | $pos"
+            exit 1
+          }
 
       - name: Tarama günlüğü
         if: always()

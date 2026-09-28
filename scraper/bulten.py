@@ -67,6 +67,9 @@ def download(kind, day, today):
     f["__EVENTARGUMENT"] = ""
     r = s.post(URL, data=f, headers={"Referer": URL, "Origin": "https://ekap.kik.gov.tr"}, timeout=180)
     if not r.content.startswith(b"PK"):
+        global LAST_FAIL
+        txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", r.text)))
+        LAST_FAIL = f"HTTP {r.status_code} {r.headers.get('Content-Type')} | " + " ".join(re.findall(r"[^.]*(?:bülten|Bülten|hata|Hata|bulunamad|seçiniz|Seçiniz|tarih)[^.]*\.", txt))[:900]
         return None
     z = zipfile.ZipFile(io.BytesIO(r.content))
     pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
@@ -83,8 +86,18 @@ def notice(title, msg):
     print(f"::notice title={title}::{msg}")
 
 
+LAST_FAIL = ""
+
+
 def probe():
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=3))).date()
+    # Arşiv: farklı günler (hafta içi) için Yapım bülteni
+    for back in (1, 3, 7, 30):
+        d = today - dt.timedelta(days=back)
+        pdf = download("Yapım", d, today)
+        notice(f"Arşiv {d} ({d.strftime('%a')})", (f"{len(pdf)//1024} KB PDF" if pdf else "indirilemedi: " + LAST_FAIL))
+        time.sleep(3)
+    return
     # 1) İçindekiler başlıkları + "Bedeli"/"Yüklenici" bağlamı (sonuç ilanı var mı?)
     for kind in ("Mal", "Hizmet"):
         pdf = download(kind, today, today)

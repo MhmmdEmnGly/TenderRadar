@@ -85,6 +85,28 @@ def notice(title, msg):
 
 def probe():
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=3))).date()
+    # 1) İçindekiler başlıkları + "Bedeli"/"Yüklenici" bağlamı (sonuç ilanı var mı?)
+    for kind in ("Mal", "Hizmet"):
+        pdf = download(kind, today, today)
+        if not pdf:
+            notice(f"TOC {kind}", "indirilemedi"); continue
+        text, pages = pdf_text(pdf)
+        heads = [l.strip() for l in text.splitlines() if re.match(r"^\s*([A-Z]-|\d+\.(\d+\.)?)\s+[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ0-9 ,()/-]{4,}", l.strip())]
+        seen = []
+        for h in heads:
+            h = re.sub(r"\.{3,}.*$", "", h).strip()
+            if h not in seen:
+                seen.append(h)
+        notice(f"TOC {kind}", " | ".join(seen[:60]))
+        for word in ("Bedeli", "Yüklenici"):
+            ctx = [text[max(0, m.start() - 160):m.start() + 160].replace("\n", " ") for m in re.finditer(word, text)][:3]
+            notice(f"{kind} '{word}' bağlamı", "\n---\n".join(ctx))
+        time.sleep(3)
+    # 2) Arşiv: 30 gün önceki Yapım bülteni indirilebiliyor mu?
+    old = today - dt.timedelta(days=30)
+    pdf = download("Yapım", old, today)
+    notice("Arşiv", f"{old}: " + (f"{len(pdf)//1024} KB PDF" if pdf else "indirilemedi"))
+    return
     for kind in ("Yapım", "Mal"):
         pdf = download(kind, today, today)
         if not pdf:

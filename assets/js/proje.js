@@ -1,0 +1,990 @@
+/*
+ * Tender Radar — Proje özeti
+ * İhale dokümanlarını (EKAP ZIP'i, PDF, DOCX, XLSX…) tarayıcıda okur, türlerine ayırır (idari / teknik şartname,
+ * birim fiyat cetveli, sözleşme tasarısı…) ve ihalenin künyesini, kapsamını, kalem listesini, teknik öne çıkanlarını,
+ * yeterlik ve mali şartlarını, dikkat edilecek noktaları çıkarır. Dosyalar sunucuya değil, kullanıcının kendi
+ * Supabase alanına (özel depolama) yüklenir. İsteğe bağlı olarak kullanıcının kendi Claude API anahtarıyla
+ * yapay zekâ özeti üretilir (anahtar yalnızca o tarayıcıda saklanır).
+ */
+(function () {
+  "use strict";
+
+  const LIB = {
+    pdf: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+    pdfWorker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
+    zip: "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",
+    xlsx: "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js",
+    sdk: "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.129.0/+esm"
+  };
+  const BUCKET = "ihale-dokuman";
+  const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
+  const MAX_UPLOAD = 50 * 1024 * 1024;
+  const AI_MODEL = "claude-opus-5-5";
+  const KEY_STORE = "tr.anthropicKey";
+
+  // ---------- Kütüphane yükleme ----------
+  const loaded = {};
+  function loadScript(src) {
+    return loaded[src] || (loaded[src] = new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = src; s.onload = res;
+      s.onerror = () => { delete loaded[src]; rej(new Error("Kütüphane yüklenemedi (internet bağlantısını kontrol et): " + src.split("/").pop())); };
+      document.head.appendChild(s);
+    }));
+  }
+  async function pdfLib() { await loadScript(LIB.pdf); window.pdfjsLib.GlobalWorkerOptions.workerSrc = LIB.pdfWorker; return window.pdfjsLib; }
+  async function zipLib() { await loadScript(LIB.zip); return window.JSZip; }
+  async function xlsxLib() { await loadScript(LIB.xlsx); return window.XLSX; }
+
+  // ---------- Metin yardımcıları ----------
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const FOLD = { ç: "c", ğ: "g", ı: "i", ö: "o", ş: "s", ü: "u", â: "a", î: "i", û: "u" };
+  const fold = (s) => String(s || "").toLocaleLowerCase("tr-TR").replace(/[çğıöşüâîû]/g, (c) => FOLD[c]);
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").replace(/^[\s:;,.\-–]+|[\s;,\-–]+$/g, "").replace(/([^.])\.$/, "$1").trim();
+  const cut = (s, n) => { s = clean(s); if (s.length <= n) return s; const i = s.lastIndexOf(" ", n); return s.slice(0, i > n * 0.6 ? i : n) + "…"; };
+  const sentenceCut = (s, n) => { s = clean(s); if (s.length <= n) return s; const i = s.lastIndexOf(". ", n); return i > n * 0.4 ? s.slice(0, i + 1) : cut(s, n); };
+  // Cümle ortasından başlayan yakalamaların baştaki yarım kelimesini at ("tlerinden sonra…" → "sonra…")
+  const dropFragment = (s) => String(s).replace(/^[a-zçğıöşü]\S*\s+/, "");
+  const extOf = (n) => (String(n).toLowerCase().match(/\.([a-z0-9]{1,5})$/) || [])[1] || "";
+  const uid = () => Math.random().toString(36).slice(2, 10);
+  function trNum(v) {
+    let s = String(v || "").replace(/\s/g, "");
+    if (!/\d/.test(s)) return NaN;
+    if (s.includes(",")) s = s.replace(/\./g, "").replace(",", ".");
+    else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, "");
+    return parseFloat(s);
+  }
+  const fmtQty = (n) => (isFinite(n) ? n.toLocaleString("tr-TR", { maximumFractionDigits: 3 }) : "");
+  const decodeEntities = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16))).replace(/&amp;/g, "&");
+
+  // ZIP içindeki eski (UTF-8 bayrağı olmayan) Türkçe dosya adları genellikle CP857 kodludur
+  const CP857 = { 0x80: "Ç", 0x81: "ü", 0x82: "é", 0x83: "â", 0x84: "ä", 0x85: "à", 0x87: "ç", 0x88: "ê", 0x89: "ë", 0x8a: "è", 0x8b: "ï", 0x8c: "î",
+    0x8d: "ı", 0x8e: "Ä", 0x90: "É", 0x93: "ô", 0x94: "ö", 0x95: "ò", 0x96: "û", 0x97: "ù", 0x98: "İ", 0x99: "Ö", 0x9a: "Ü", 0x9e: "Ş", 0x9f: "ş",
+    0xa0: "á", 0xa1: "í", 0xa2: "ó", 0xa3: "ú", 0xa4: "ñ", 0xa5: "Ñ", 0xa6: "Ğ", 0xa7: "ğ" };
+  function decodeZipName(bytes) {
+    const b = Array.from(bytes);
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(b)); } catch { /* UTF-8 değil */ }
+    return b.map((c) => (c < 0x80 ? String.fromCharCode(c) : CP857[c] || "_")).join("");
+  }
+
+  // ---------- Dosya okuyucular ----------
+  async function readPdf(buf) {
+    const lib = await pdfLib();
+    const pdf = await lib.getDocument({ data: new Uint8Array(buf), isEvalSupported: false }).promise;
+    const pages = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const tc = await page.getTextContent();
+      const rows = [];
+      for (const it of tc.items) {
+        if (!it.str || !it.str.trim()) continue;
+        const y = it.transform[5], x = it.transform[4];
+        let r = null;
+        for (let i = rows.length - 1; i >= 0 && i >= rows.length - 40; i--) if (Math.abs(rows[i].y - y) < 3) { r = rows[i]; break; }
+        if (!r) rows.push((r = { y, parts: [] }));
+        r.parts.push({ x, s: it.str, w: it.width || 0 });
+      }
+      rows.sort((a, b) => b.y - a.y);
+      pages.push(rows.map((r) => {
+        r.parts.sort((a, b) => a.x - b.x);
+        let out = "", end = null;
+        for (const q of r.parts) {
+          if (end != null) {
+            const gap = q.x - end;
+            if (gap > 14) out += " | ";
+            else if (gap > 1.2 && !/\s$/.test(out) && !/^\s/.test(q.s)) out += " ";
+          }
+          out += q.s; end = q.x + q.w;
+        }
+        return out.replace(/\s+$/, "");
+      }).join("\n"));
+      page.cleanup();
+    }
+    const text = pages.join("\n\f");
+    const letters = (text.match(/\p{L}/gu) || []).length;
+    return { text, pages: pdf.numPages, scanned: letters < 60 * pdf.numPages * 0.5 && letters < 400 };
+  }
+  async function readDocx(buf) {
+    const JSZip = await zipLib();
+    const zip = await JSZip.loadAsync(buf);
+    const f = zip.file("word/document.xml");
+    if (!f) throw new Error("DOCX içeriği bulunamadı");
+    let xml = await f.async("string");
+    xml = xml.replace(/<w:tr[ >][\s\S]*?<\/w:tr>/g, (row) => row.replace(/<\/w:p>/g, " ").replace(/<\/w:tc>/g, " | ") + "\n");
+    xml = xml.replace(/<w:tab\/>/g, "\t").replace(/<w:br[^>]*\/>/g, "\n").replace(/<\/w:p>/g, "\n").replace(/<[^>]+>/g, "");
+    return { text: decodeEntities(xml).replace(/[ \t]+\n/g, "\n").replace(/ \| \n/g, "\n").replace(/\n{3,}/g, "\n\n"), pages: null };
+  }
+  async function readSheet(buf) {
+    const X = await xlsxLib();
+    const wb = X.read(buf, { type: "array" });
+    const out = [];
+    for (const n of wb.SheetNames) {
+      const rows = X.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, blankrows: false, defval: "" });
+      out.push("## " + n);
+      for (const r of rows) {
+        const cells = r.map((c) => String(c).replace(/\s+/g, " ").trim());
+        while (cells.length && !cells[cells.length - 1]) cells.pop();
+        if (cells.some(Boolean)) out.push(cells.join(" | "));
+      }
+    }
+    return { text: out.join("\n"), pages: null, sheet: true };
+  }
+  // Eski Word (.doc) ikili biçimi: metin parçaları UTF-16 ya da Windows-1254 olarak saklanır; yaklaşık okunur
+  function readLegacyDoc(buf) {
+    const u8 = new Uint8Array(buf);
+    const pick = (s, rx) => (s.match(rx) || []).filter((r) => /\p{L}{3}/u.test(r)).join("\n");
+    let a = "", b = "";
+    try { a = pick(new TextDecoder("utf-16le").decode(u8), /[\p{L}\p{N}\p{P}\p{Zs}\r\t]{8,}/gu); } catch { /* yok */ }
+    try { b = pick(new TextDecoder("windows-1254").decode(u8), /[A-Za-zÇĞİÖŞÜçğıöşü0-9 .,;:()%\/\-'"\r\t]{16,}/g); } catch { /* yok */ }
+    const score = (s) => (s.match(/\b(ve|ile|için|olarak|bir|bu|edilecektir)\b/gi) || []).length;
+    const text = (score(a) >= score(b) ? a : b).replace(/\r/g, "\n");
+    return { text, pages: null, approx: true };
+  }
+
+  // ---------- Belge türü ----------
+  const TYPES = {
+    idari: "İdari şartname", teknik: "Teknik şartname", cetvel: "Birim fiyat / kalem listesi", sozlesme: "Sözleşme tasarısı",
+    ilan: "İhale ilanı", zeyil: "Zeyilname", form: "Standart form", diger: "Diğer"
+  };
+  const TYPE_ORDER = ["idari", "teknik", "cetvel", "sozlesme", "ilan", "zeyil", "form", "diger"];
+  function classify(name, text, sheet) {
+    const n = " " + fold(name).replace(/[_\-.()]+/g, " ") + " ";
+    const h = fold(String(text || "").slice(0, 4000)).replace(/\s+/g, " ");
+    if (/zeyilname/.test(n)) return "zeyil";
+    if (/idari sartname|\bidari\b/.test(n)) return "idari";
+    if (/teknik/.test(n)) return "teknik";
+    if (/birim ?fiyat|teklif ?cetvel|cetvel|mal listesi|malzeme listesi|kesif|metraj|mahal listesi|fiyat teklif|kalem listesi|miktar/.test(n)) return "cetvel";
+    if (/sozlesme/.test(n)) return "sozlesme";
+    if (/\bilan/.test(n)) return "ilan";
+    if (/standart form|\bkik ?\d{3}|\bform\b|beyan|mektub/.test(n)) return "form";
+    if (/idari sartname/.test(h)) return "idari";
+    if (/teknik sartname/.test(h)) return "teknik";
+    if (/birim fiyat teklif cetveli|teklif cetveli|birim fiyat cetveli|mal listesi|kesif ozeti/.test(h)) return "cetvel";
+    if (/sozlesme tasarisi|tip sozlesme|sozlesme taslagi/.test(h)) return "sozlesme";
+    if (/zeyilname/.test(h)) return "zeyil";
+    if (/ihale ilani/.test(h)) return "ilan";
+    if (sheet) return "cetvel";
+    return "diger";
+  }
+
+  // ---------- Dosyaları aç (ZIP içindekiler dahil) ----------
+  async function extractFiles(fileList, onStep) {
+    const out = [];
+    async function one(name, buf, depth, from) {
+      const ext = extOf(name);
+      if (ext === "zip") {
+        if (depth > 3) return;
+        onStep && onStep(`ZIP açılıyor: ${name}`);
+        const JSZip = await zipLib();
+        const zip = await JSZip.loadAsync(buf, { decodeFileName: decodeZipName });
+        for (const e of Object.values(zip.files)) {
+          if (e.dir || /(^|\/)(__MACOSX|\._)|thumbs\.db$|desktop\.ini$/i.test(e.name)) continue;
+          await one(e.name.split("/").pop(), await e.async("arraybuffer"), depth + 1, e.name);
+        }
+        return;
+      }
+      const doc = { id: uid(), name, path: from || name, size: buf.byteLength, ext, type: "diger", text: "", pages: null, scanned: false, blob: new Blob([buf]) };
+      onStep && onStep(`Okunuyor: ${name}`);
+      try {
+        let r;
+        if (ext === "pdf") r = await readPdf(buf);
+        else if (ext === "docx" || ext === "docm") r = await readDocx(buf);
+        else if (["xlsx", "xls", "xlsm", "ods", "csv"].includes(ext)) r = await readSheet(buf);
+        else if (ext === "doc") r = readLegacyDoc(buf);
+        else if (ext === "txt") r = { text: new TextDecoder().decode(buf) };
+        else if (["htm", "html"].includes(ext)) r = { text: new DOMParser().parseFromString(new TextDecoder().decode(buf), "text/html").body.innerText || "" };
+        else if (["rar", "7z"].includes(ext)) throw new Error(`${ext.toUpperCase()} arşivi tarayıcıda açılamıyor — dosyaları çıkarıp ZIP ya da tek tek yükle`);
+        else if (["jpg", "jpeg", "png", "tif", "tiff"].includes(ext)) r = { text: "", scanned: true, image: true };
+        else throw new Error("Desteklenmeyen dosya türü");
+        Object.assign(doc, r);
+      } catch (e) { doc.error = e.message || String(e); }
+      if (doc.text.length > MAX_TEXT) { doc.text = doc.text.slice(0, MAX_TEXT); doc.truncated = true; }
+      doc.chars = doc.text.length;
+      doc.type = classify(name, doc.text, doc.sheet);
+      out.push(doc);
+    }
+    for (const f of fileList) await one(f.name, await f.arrayBuffer(), 0, null);
+    return out;
+  }
+
+  // ---------- Çıkarım ----------
+  function prep(doc) {
+    if (doc._flat != null) return doc;
+    let pages = String(doc.text || "").split("\f").map((p) => p.split("\n"));
+    // Her sayfada tekrar eden üst/alt bilgi satırlarını (doküman no, telif notu, sayfa no) çıkar
+    if (pages.length >= 3) {
+      const norm = (l) => l.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+      const cnt = new Map();
+      pages.forEach((ls) => new Set(ls.map(norm)).forEach((k) => k && cnt.set(k, (cnt.get(k) || 0) + 1)));
+      const lim = Math.max(3, pages.length * 0.4);
+      pages = pages.map((ls) => ls.filter((l) => (cnt.get(norm(l)) || 0) < lim));
+    }
+    doc._flat = pages.map((ls) => ls.join("\n").replace(/\s*\|\s*/g, " ").replace(/\s+/g, " ").trim()).join("\f");
+    doc._lines = [];
+    pages.forEach((ls, i) => ls.forEach((l) => { if (l.trim()) doc._lines.push({ t: l, page: i + 1 }); }));
+    return doc;
+  }
+  function pageAt(doc, idx) {
+    if (!doc.pages) return null;
+    let c = 1;
+    for (let i = 0; i < idx; i++) if (doc._flat.charCodeAt(i) === 12) c++;
+    return c;
+  }
+  // Belgeleri tür önceliğine göre tarar; ilk eşleşmeyi kaynağıyla (belge, sayfa) döndürür
+  function find(docs, types, rxs, pick) {
+    const ordered = [...types.flatMap((t) => docs.filter((d) => d.type === t))];
+    for (const d of ordered) {
+      prep(d);
+      for (const rx of rxs) {
+        const m = rx.exec(d._flat);
+        if (!m) continue;
+        const v = pick ? pick(m) : m[1];
+        if (v == null || v === "") continue;
+        return { v, src: { name: d.name, type: d.type, page: pageAt(d, m.index) } };
+      }
+    }
+    return null;
+  }
+  const NEXT = String.raw`(?=\s+(?:[a-zçğıöşü]\)|\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\.?\s|\d{1,2}\s*[-–]\s|Madde \d)|\f|$)`;
+  const R = (s, f = "u") => new RegExp(s.replace(/NEXT/g, NEXT), f);
+
+  const ADM = ["idari", "ilan", "sozlesme", "zeyil", "diger", "teknik"];
+  const CONTRACT = ["sozlesme", "idari", "teknik", "diger"];
+  const TECH = ["teknik", "diger", "cetvel", "sozlesme", "idari"];
+
+  function extractFields(docs) {
+    const f = {};
+    const put = (k, r, fmt) => { if (r) f[k] = { v: fmt ? fmt(r.v) : clean(r.v), src: r.src }; };
+
+    put("idare", find(docs, ADM, [R(String.raw`İdarenin\s*[;:,]?\s*a\)\s*Ad[ıi]\s*:?\s*(.{3,180}?)\s+b\)\s*Adres`),
+      R(String.raw`İdarenin\s+ad[ıi]\s*:\s*(.{3,160}?)NEXT`)]), (v) => cut(v, 160));
+    put("adres", find(docs, ADM, [R(String.raw`İdarenin\s*[;:,]?\s*a\)[\s\S]{0,200}?b\)\s*Adresi?\s*:?\s*(.{5,220}?)\s+c\)`)]), (v) => cut(v, 200));
+    const ta = find(docs, ADM, [R(String.raw`İhale konusu\s+(mal[ıi]n|hizmetin|yap[ıi]m işinin|danışmanlık hizmetinin|işin)`)]);
+    if (ta) {
+      const k = fold(ta.v);
+      f.tur = { v: /^mal/.test(k) ? "Mal alımı" : /^hizmet/.test(k) ? "Hizmet alımı" : /^yap/.test(k) ? "Yapım işi" : /^dan/.test(k) ? "Danışmanlık hizmeti" : "", src: ta.src };
+      if (!f.tur.v) delete f.tur;
+    }
+    put("isAdi", find(docs, ADM, [
+      R(String.raw`İhale konusu\s+(?:mal[ıi]n|hizmetin|yap[ıi]m işinin|danışmanlık hizmetinin|işin)\s*[;:,]?\s*a\)\s*Ad[ıi]\s*:?\s*(.{3,300}?)\s+b\)`),
+      R(String.raw`(?:İşin|İhalenin|İhale konusu işin)\s+[Aa]d[ıi]\s*:\s*(.{3,250}?)NEXT`)]), (v) => cut(v, 260));
+    put("miktar", find(docs, ADM, [R(String.raw`(?:Miktar[ıi] ve türü|Niteliği,? türü ve miktar[ıi]|Niteliği,? türü ve miktar[ıi])\s*:?\s*(.{3,600}?)NEXT`)]), (v) => cut(v, 420));
+    put("yer", find(docs, ADM, [R(String.raw`(?:Teslim (?:edileceği )?[Yy]er(?:i)?|[İi]şin [Yy]apılacağı [Yy]er(?:i)?|Yapılacağı [Yy]er(?:\/teslim yeri)?)\s*[:：]\s*(.{3,320}?)NEXT`)]), (v) => cut(v, 260));
+    put("sure", find(docs, ["idari", "ilan", "zeyil"], [
+      R(String.raw`(?:Teslim tarihi|[İi]şin süresi|Yapım [Ss]üresi|Süresi|Teslim süresi|İşe başlama ve bitiş tarihleri)\s*[:：]\s*(?:\d{1,2}(?:\.\d{1,2}){1,3}\.?\s+)?(.{3,420}?)NEXT`)]), (v) => cut(v, 300));
+    put("usul", find(docs, ADM, [R(String.raw`İhale [Uu]sulü\s*:?\s*(.{3,300}?)NEXT`)]), (v) => {
+      const k = /(açık ihale(?: usulü)?|belli istekliler arasında ihale(?: usulü)?|pazarlık usulü(?: \(\d+\/[a-z]\))?|doğrudan temin|elektrik dağıtım şirketleri[^.]{0,70}yönetmeliği|21\/[a-zç]\)?)/i.exec(v);
+      return k ? k[1].charAt(0).toLocaleUpperCase("tr-TR") + k[1].slice(1) : cut(v, 90);
+    });
+    const dt = find(docs, ADM, [R(String.raw`(?:İhale|[Tt]eklif(?:lerin)?\s+(?:son\s+)?(?:verme|teslim))[^\d\f]{0,70}?(\d{1,2}[./]\d{1,2}[./]\d{4})(?:\D{0,40}?(\d{1,2}[:.]\d{2}))?`)],
+      (m) => m[1].replace(/\//g, ".") + (m[2] ? " " + m[2].replace(".", ":") : ""));
+    if (dt) f.tarih = { v: dt.v, src: dt.src };
+    const et = find(docs, ADM, [R(String.raw`(e-teklif|elektronik ortamda (?:teklif|alınacak)|EKAP üzerinden (?:alınacak|verilecek|teklif))`, "iu")]);
+    if (et) f.eteklif = { v: "e-teklif (EKAP, e-imza gerekir)", src: et.src };
+    put("toplanti", find(docs, ADM, [R(String.raw`(?:toplantı yeri|İhale komisyonunun toplantı yeri|[Tt]ekliflerin (?:verileceği|sunulacağı) (?:adres|yer))\s*(?:\(e-tekliflerin açılacağı adres\))?\s*:?\s*(.{3,220}?)NEXT`)]), (v) => cut(v, 200));
+
+    // Yeterlik ve mali şartlar
+    put("deneyim", find(docs, ADM, [
+      R(String.raw`(?:[İi]ş deneyim|deneyimini gösteren|deneyim belge)[^%\f]{0,320}?%\s*(\d{1,3})`),
+      R(String.raw`[Bb]enzer iş(?:e ilişkin)?[^%\f]{0,200}?(?:teklif edilen|teklif ettiği)[^%\f]{0,40}?%\s*(\d{1,3})`)]), (v) => "%" + v);
+    put("benzerIs", find(docs, ADM, [
+      R(String.raw`[Bb]u ihalede benzer iş olarak\s*[;:,]?\s*(.{5,450}?)\s*(?:kabul edilecektir|dikkate alınacaktır|benzer iş sayılacaktır|kabul edilir)`),
+      R(String.raw`[Bb]enzer iş olarak kabul edilecek (?:işler|mallar|hizmetler)\s*(?:aşağıda belirtilmiştir)?\s*[:;]?\s*(.{5,600}?)(?=\s+\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\.?\s|\f|$)`)]), (v) => cut(v, 380));
+    const st = find(docs, ADM, [R(String.raw`(anahtar teslimi götürü bedel|teklif birim fiyat|götürü bedel)[^.\f]{0,60}?(?:üzerinden|alınarak|sözleşme imzala)`, "iu")]);
+    if (st) f.sozTuru = { v: /birim/i.test(st.v) ? "Teklif birim fiyat" : /anahtar/i.test(st.v) ? "Anahtar teslimi götürü bedel" : "Götürü bedel", src: st.src };
+    const kt = find(docs, ADM, [R(String.raw`[Kk]ısmi teklif\s*(verilemez|verilebilir|verilmesine izin verilmemektedir|verilemeyecektir|verilebilecektir|kabul edilmeyecektir|kabul edilecektir)`)]);
+    if (kt) f.kismi = { v: /(emez|mez|miyor|memektedir|meyecek|mayacak)/.test(kt.v) ? "Verilemez" : "Verilebilir", src: kt.src };
+    put("gecici", find(docs, ADM, [R(String.raw`[Gg]eçici teminat[^%\f]{0,220}?%\s*([\d,]+)`)]), (v) => "%" + v);
+    put("kesin", find(docs, ADM, [R(String.raw`(?:bedelinin|bedeli üzerinden)[^%\f]{0,60}?%\s*([\d,]+)['’]?\w*\s+oranında kesin teminat`), R(String.raw`[Kk]esin teminat[^%\f]{0,220}?%\s*([\d,]+)`)]), (v) => "%" + v);
+    const ff = find(docs, ADM.concat(["sozlesme"]), [R(String.raw`[Ff]iyat farkı\s*(?:hesaplanmayacak|hesaplanacak|verilmeyecek|verilecek|ödenmeyecek|ödenecek|hesaplanmaz|verilmez|ödenmez)\w*`)]);
+    if (ff) { const s = fold(ff.v); f.fiyatFarki = { v: /(mayacak|meyecek|maz\b|mez\b)/.test(s) ? "Verilmeyecek" : "Verilecek", src: ff.src }; }
+    const av = find(docs, ADM.concat(["sozlesme"]), [R(String.raw`[Aa]vans\s*(?:verilmeyecek|verilecek|ödenmeyecek|ödenecek|verilmez)\w*`)]);
+    if (av) { const s = fold(av.v); f.avans = { v: /(meyecek|mez\b)/.test(s) ? "Verilmeyecek" : "Verilecek", src: av.src }; }
+    const yr = find(docs, ADM, [R(String.raw`yerli (?:malı teklif eden )?istekli(?:ler)?(?: lehine)?[^%\f]{0,180}?%\s*(\d{1,2})`), R(String.raw`%\s*(\d{1,2})[^.\f]{0,90}?fiyat avantajı`)]);
+    if (yr) f.yerli = { v: "%" + yr.v + " fiyat avantajı", src: yr.src };
+    put("sinir", find(docs, ADM, [R(String.raw`[Ss]ınır değer[^\f]{0,500}?\bN\b[^\d\f]{0,40}?(\d[,.]\d{1,2})`)]));
+    put("gecerlilik", find(docs, ADM, [R(String.raw`[Tt]ekliflerin geçerlilik süresi[^\d\f]{0,90}?(\d{2,3})\s*(?:\([^)]{0,25}\))?\s*takvim günü`)]), (v) => v + " takvim günü");
+    const ay = find(docs, ADM, [R(String.raw`açıklama[^.\f]{0,160}?ihale tarihinden\s*(?:en geç\s*)?(\d{1,2}|on|yedi|beş|üç)\s*(?:\([^)]{0,10}\)\s*)?(?:gün|iş günü) önce`)]);
+    if (ay) { const w = { on: 10, yedi: 7, beş: 5, üç: 3 }; f.aciklamaGun = { v: +(w[ay.v] || ay.v), src: ay.src }; }
+    const alt = find(docs, ADM, [R(String.raw`([^.\f]{0,120}alt yüklenici(?:ye|lere)?\s+(?:yaptırılamaz|yaptırılabilir|yaptırılmayacaktır|çalıştırılabilir|çalıştırılamaz|verilebilir|verilemez|devredilemez)[^.\f]{0,80})`)]);
+    if (alt) f.altYuk = { v: cut(alt.v, 220), src: alt.src };
+    put("ceza", find(docs, CONTRACT, [
+      R(String.raw`(?:gecikme|geciken her|gecikilen her)[^.\f]{0,240}?((?:binde|yüzde|%)\s*[\d,]+(?:\s*\([^)]{0,20}\))?)`),
+      R(String.raw`((?:binde|yüzde|%)\s*[\d,]+(?:\s*\([^)]{0,20}\))?)[^.\f]{0,140}?gecikme cezası`)]));
+
+    // Sözleşme ve teknik şartnameden
+    put("teslimSure", find(docs, CONTRACT, [R(String.raw`(?:[Tt]eslim|[İi]şin|[Ss]özleşmenin)\s+süresi[^.\d\f]{0,80}?(\d{1,4}\s*(?:\([^)]{0,25}\)\s*)?(?:takvim günü|iş günü|gün|ay|yıl))`)]));
+    put("garanti", find(docs, TECH, [
+      R(String.raw`[Gg]aranti süresi[^.\d\f]{0,80}?(\d{1,2}\s*(?:\([^)\d]{0,15}\)\s*)?(?:yıl|ay|sene))`),
+      R(String.raw`(\d{1,2}\s*(?:\([^)\d]{0,15}\)\s*)?(?:yıl|ay|sene))[^.\f]{0,30}?garanti`)]));
+    put("egitim", find(docs, TECH, [R(String.raw`([^.\f]{0,80}eğitim[^.\f]{0,140}?\d{1,3}\s*(?:kişi|gün|saat|personel|iş günü)[^.\f]{0,60})`),
+      R(String.raw`([^.\f]{0,80}\d{1,3}\s*(?:kişi\w*|gün|saat|personel\w*)[^.\f]{0,60}eğitim[^.\f]{0,60})`)]), (v) => cut(dropFragment(v), 200));
+    const fat = find(docs, TECH, [R(String.raw`(\bFAT\b|[Ff]abrika [Kk]abul)`)]);
+    if (fat) f.fat = { v: "Fabrika kabul testi (FAT) isteniyor", src: fat.src };
+    const sat = find(docs, TECH, [R(String.raw`(\bSAT\b|[Ss]aha [Kk]abul)`)]);
+    if (sat) f.sat = { v: "Saha kabul testi (SAT) isteniyor", src: sat.src };
+    put("yedek", find(docs, TECH, [R(String.raw`([^.\f]{0,60}yedek parça[^.\f]{0,140}?\d{1,2}\s*(?:\([^)]{0,12}\)\s*)?(?:yıl|sene)[^.\f]{0,40})`)]), (v) => cut(dropFragment(v), 180));
+    const kl = f.miktar && f.miktar.v.match(/(\d+)\s*(?:\([^)]{0,15}\)\s*)?kalem/i);
+    if (kl) f.kalemIlan = { v: +kl[1], src: f.miktar.src };
+    return f;
+  }
+
+  // ---------- Kalem listesi (birim fiyat teklif cetveli, mal listesi, keşif) ----------
+  const UNIT = String.raw`(?:adet|ad\.?|takım|tk\.?|set|metre|mt\.?|m|m²|m2|m³|m3|mtül|kg|ton|lt\.?|litre|paket|lisans|kalem|hizmet|ay|gün|saat|km|kişi|adam\/ay|adam\/gün|adam-ay|götürü|gtr\.?|sistem|proje|parti|rulo|kutu|çift|koli|boy|nokta|istasyon|yıl|kVA|kW)`;
+  const RX_A = new RegExp(String.raw`^\s*([A-Z]?\d{1,4}(?:[.\-]\d{1,3}){0,2})[.)]?\s+(.{3,240}?)\s+(${UNIT})\s+(\d[\d.,]*)(?=\s|$)`, "iu");
+  const RX_B = new RegExp(String.raw`^\s*([A-Z]?\d{1,4})[.)]?\s+(.{3,240}?)\s+(\d[\d.,]*)\s+(${UNIT})(?=\s|$)`, "iu");
+  function parseItems(docs) {
+    const items = [], seen = new Set();
+    const add = (it, d, page) => {
+      it.name = clean(it.name).replace(/^\|\s*|\s*\|$/g, "");
+      if (!it.name || !/\p{L}{3}/u.test(it.name) || !(it.qty > 0) || /^(sıra|toplam|genel toplam|ara toplam|kdv)/i.test(it.name) || /\s[x×]$/i.test(it.name)) return;
+      const k = fold(it.no + "|" + it.name + "|" + it.qty);
+      if (seen.has(k)) return;
+      seen.add(k); items.push({ ...it, src: { name: d.name, type: d.type, page } });
+    };
+    const pool = docs.filter((d) => d.type === "cetvel");
+    const extra = docs.filter((d) => d.type !== "cetvel" && d.type !== "form" && /\bmiktar/i.test(d.text || "") && /\bbirim/i.test(d.text || ""));
+    for (const d of pool.concat(extra)) {
+      if (d.type !== "cetvel" && items.length) break;   // cetvel bulunduysa diğer belgelerdeki tablolara bakma
+      prep(d);
+      const before = items.length;
+      // 1) Hücreli satırlar (XLSX / DOCX tablosu / PDF sütun boşlukları): başlık satırından sütunları bul
+      let hdr = null;
+      for (const { t, page } of d._lines) {
+        if (/^## /.test(t)) { hdr = null; continue; }
+        if (!t.includes(" | ")) continue;
+        const cells = t.split(" | ").map((s) => s.trim());
+        const f = cells.map(fold);
+        const qi = f.findIndex((c) => /^miktar/.test(c));
+        const ni = f.findIndex((c) => /aciklama|\badi\b|adı|cinsi|tanim|is kalemi|malzeme|urun|hizmetin|isin|kalem adi/.test(c));
+        if (qi >= 0 && ni >= 0 && qi !== ni) {
+          hdr = { qi, ni, ui: f.findIndex((c, i) => i !== qi && /^birim(i)?$|olcu birimi|^birimi|^olcu/.test(c)), noi: f.findIndex((c) => /^sira|^no\b|^s\.? ?no|^poz/.test(c)) };
+          continue;
+        }
+        if (hdr && cells.length > Math.max(hdr.qi, hdr.ni)) {
+          add({ no: hdr.noi >= 0 ? cells[hdr.noi] || "" : "", name: cells[hdr.ni], unit: hdr.ui >= 0 ? cells[hdr.ui] || "" : "", qty: trNum(cells[hdr.qi]) }, d, page);
+        }
+      }
+      if (items.length > before) continue;
+      // 2) Düz metin satırları: "1  SCADA yazılımı  Adet  1,000" / "1 Kablo 250 metre"
+      if (d.type !== "cetvel" && !/(birim fiyat|teklif cetveli|mal listesi|keşif özeti|malzeme listesi)/i.test(d.text)) continue;
+      for (const { t, page } of d._lines) {
+        const line = t.replace(/\s*\|\s*/g, "  ");
+        let m = RX_A.exec(line);
+        if (m) { add({ no: m[1], name: m[2], unit: m[3], qty: trNum(m[4]) }, d, page); continue; }
+        m = RX_B.exec(line);
+        if (m) add({ no: m[1], name: m[2], unit: m[4], qty: trNum(m[3]) }, d, page);
+      }
+    }
+    return items;
+  }
+
+  // ---------- Teknik analiz ----------
+  const DOMAIN = ["SCADA", "RTU", "PLC", "HMI", "DCS", "IEC 61850", "IEC 60870-5-104", "IEC 60870-5-101", "Modbus", "DNP3", "OPC UA", "Profinet", "Profibus",
+    "fiber optik", "GPRS", "LTE", "4G", "telemetri", "telekontrol", "uzaktan izleme", "uzaktan kumanda", "veri tabanı", "sunucu", "yedekli", "siber güvenlik",
+    "güvenlik duvarı", "UPS", "enerji analizörü", "koruma rölesi", "röle", "trafo merkezi", "dağıtım merkezi", "OG hücre", "kompanzasyon", "akıllı sayaç", "OSOS",
+    "pompa", "frekans konvertörü", "sürücü", "debimetre", "seviye sensörü", "basınç", "klor", "ADMS", "OMS", "DMS", "CBS", "GIS", "SIEM", "NTP", "GPS", "switch", "router",
+    "kabinet", "pano", "lisans", "yazılım", "entegrasyon", "devreye alma", "bakım", "eğitim"];
+  const BRANDS = ["Siemens", "ABB", "Schneider", "General Electric", "GE Vernova", "SEL", "Hitachi", "Emerson", "Honeywell", "Yokogawa", "Rockwell", "Allen-Bradley",
+    "AVEVA", "Wonderware", "Ignition", "Inductive Automation", "Phoenix Contact", "Moxa", "Hirschmann", "Cisco", "Mitsubishi", "Omron", "Beckhoff", "WAGO", "Survalent",
+    "Eaton", "Legrand", "Janitza", "Entes", "Klemsan", "Weidmüller", "Advantech", "Dell", "HPE", "Lenovo", "Fortinet", "Palo Alto", "Microsoft", "Oracle",
+    "Endress+Hauser", "Krohne", "Danfoss", "Grundfos", "Unitronics", "Ruggedcom", "Teltonika", "Huawei", "Kalkitech", "Iconics", "zenon", "COPA-DATA", "WinCC",
+    "iFIX", "Proficy", "PcVue", "FactoryTalk", "Citect", "Mikrodev", "Elimko", "Tümsan", "Ventus", "Schweitzer", "Vinci", "Arteche", "Efacec", "NR Electric", "Nari"];
+  const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  function countTerm(flatFold, term) {
+    const t = fold(term);
+    const short = t.replace(/[^a-z0-9]/g, "").length <= 4;
+    const rx = new RegExp((short ? String.raw`(?:^|[^a-z0-9])` : String.raw`(?:^|[^a-z0-9])`) + reEsc(t) + (short ? String.raw`(?![a-z0-9])` : ""), "g");
+    return (flatFold.match(rx) || []).length;
+  }
+  function techAnalysis(docs, userKw) {
+    const tech = docs.filter((d) => d.type === "teknik");
+    const base = tech.length ? tech : docs.filter((d) => ["diger", "cetvel", "idari"].includes(d.type));
+    base.forEach(prep);
+    const flat = base.map((d) => d._flat).join("\n");
+    const ff = fold(flat);
+    const terms = [...new Map([...DOMAIN, ...(userKw || [])].map((k) => [fold(k), k])).values()];
+    const kw = terms.map((k) => ({ k, n: countTerm(ff, k) })).filter((x) => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 16);
+    const std = new Map();
+    for (const m of flat.matchAll(/\b(TS\s?EN|IEC\/EN|IEC|EN|TS|ISO\/IEC|ISO|IEEE|NEMA|DIN|VDE|ANSI|ITU-T)\s?[-]?\s?(\d{2,5}(?:[-–.]\d{1,3}){0,3})(?::\d{4})?\b/g)) {
+      if (/^(TS|EN)$/.test(m[1]) && m[2].length < 3) continue;
+      const k = (m[1].replace(/\s+/g, " ") + " " + m[2].replace("–", "-")).trim();
+      std.set(k, (std.get(k) || 0) + 1);
+    }
+    const standards = [...std.entries()].sort((a, b) => b[1] - a[1]).slice(0, 18).map(([k, n]) => ({ k, n }));
+    const brands = BRANDS.map((b) => {
+      const rx = b.length <= 4 ? new RegExp(String.raw`(?:^|[^\p{L}\d])` + reEsc(b) + String.raw`(?![\p{L}\d])`, "gu") : new RegExp(reEsc(b), "giu");
+      return { k: b, n: (flat.match(rx) || []).length };
+    }).filter((x) => x.n > 0).sort((a, b) => b.n - a.n);
+    const muadil = (ff.match(/muadil|esdeger/g) || []).length;
+    // Metinde "12 adet RTU" gibi geçen miktarlar
+    const qmap = new Map();
+    for (const m of flat.matchAll(/(\d{1,4})\s*(?:adet|ad\.|takım|set)\s+([A-ZÇĞİÖŞÜa-zçğıöşü][^\s,.;:()]*(?:\s+[^\s,.;:()|]+){0,4})/g)) {
+      const name = clean(m[2]).replace(/\s+(ve|ile|için|olarak|olacak\w*|bulunan|temin|montaj\w*)$/i, "");
+      if (name.length < 3 || /^(olarak|ve|ile|için|adet|olmak)$/i.test(name)) continue;
+      const k = fold(name) + "|" + m[1];
+      if (!qmap.has(k)) qmap.set(k, { qty: +m[1], name });
+    }
+    const quantities = [...qmap.values()].slice(0, 14);
+    // Başlıklar (içindekiler)
+    const heads = [], hs = new Set();
+    const headOf = (t) => {
+      t = t.replace(/\s*\|\s*/g, " ").trim();
+      if (t.length > 72 || /\.{4,}|…/.test(t)) return null;
+      const m = t.match(/^(\d{1,2}(?:\.\d{1,2})?)[.)]?\s+([A-ZÇĞİÖŞÜ][^.:;!?]{2,68})$/u);
+      if (!m || /[,]$/.test(m[2]) || m[2].split(/\s+/).length > 9 || /\d|°|~/.test(m[2])) return null;
+      if ((m[2].match(/\(/g) || []).length !== (m[2].match(/\)/g) || []).length) return null;
+      const letters = m[2].replace(/[^A-Za-zÇĞİÖŞÜçğıöşü]/g, "");
+      const upper = letters === letters.toLocaleUpperCase("tr-TR");
+      const title = m[2].split(/\s+/).filter((w) => /^\p{Ll}/u.test(w) && !/^(ve|ile|veya|için|ait|olan|dair|ilişkin|göre)$/.test(w)).length <= 1;
+      return letters.length >= 3 && (upper || title) ? { no: m[1], text: m[2].trim() } : null;
+    };
+    const isSub = (no) => /^\d{1,2}\.[1-9]/.test(no);   // 3.1 alt başlık; 3.0 / 3 ana başlık
+    for (const d of tech) {
+      let last = 0;
+      for (const { t } of d._lines) {
+        const h = headOf(t);
+        if (!h || h.no.split(".").length > 2) continue;
+        const top = parseInt(h.no, 10);
+        if (!(top === last || top === last + 1 || (last === 0 && top <= 2))) continue;   // tablo satırlarındaki sayıları ele
+        last = top;
+        const k = fold(h.text);
+        if (hs.has(k)) continue;
+        hs.add(k); heads.push(h.no + " " + h.text);
+        if (heads.length >= 30) break;
+      }
+    }
+    // Kapsam / işin tanımı bölümü: önce başlık satırını bul, altındaki metni sonraki başlığa kadar al
+    let scope = null;
+    const SCOPE_HEAD = /^(isin kapsami|proje kapsami|kapsam|amac ve kapsam|konu ve kapsam|isin tanimi|isin konusu)\b/;
+    for (const d of tech.length ? tech : base) {
+      const L = d._lines;
+      for (let i = 0; i < L.length && !scope; i++) {
+        const raw = L[i].t.replace(/\s*\|\s*/g, " ").trim();
+        const h = headOf(raw) || (/^[A-ZÇĞİÖŞÜ ]{5,40}$/.test(raw) ? { no: "", text: raw } : null);
+        if (!h || !SCOPE_HEAD.test(fold(h.text))) continue;
+        let buf = "";
+        for (let j = i + 1; j < L.length && buf.length < 1500; j++) {
+          const u = L[j].t.replace(/\s*\|\s*/g, " ").trim();
+          if (buf.length > 60 && headOf(u) && !isSub(headOf(u).no)) break;
+          buf += " " + u;
+        }
+        if (buf.replace(/[^\p{L}]/gu, "").length > 60) scope = { v: sentenceCut(buf, 700), head: h.text, src: { name: d.name, type: d.type, page: d.pages ? L[i].page : null } };
+      }
+      if (scope) break;
+    }
+    // Teknik şartnamedeki "İşin Adı" başlığının altındaki satır (idari şartname yoksa iş adı olarak kullanılır)
+    let title = null;
+    for (const d of tech) {
+      const L = d._lines;
+      for (let i = 0; i < L.length - 1 && !title; i++) {
+        const h = headOf(L[i].t);
+        if (h && /^isin adi/.test(fold(h.text)) && L[i + 1].t.trim().length > 5) title = { v: cut(L[i + 1].t.replace(/\s*\|\s*/g, " "), 200), src: { name: d.name, type: d.type, page: d.pages ? L[i].page : null } };
+      }
+    }
+    const rxScope = /(?:^|\s)(?:\d{1,2}(?:\.\d{1,2})?[.)]?\s*)?(İŞİN KAPSAMI|KAPSAM|İŞİN TANIMI|AMAÇ VE KAPSAM|İŞİN KONUSU|KONU|AMAÇ)\s*:?\s+(.{80,1400}?)(?=\s+\d{1,2}(?:\.\d{1,2})*[.)]?\s+[A-ZÇĞİÖŞÜ]{3,}[A-ZÇĞİÖŞÜ ]{3,}|\f|$)/gu;
+    if (!scope) outer: for (const d of tech.length ? tech : base) {
+      for (const m of d._flat.matchAll(rxScope)) {
+        if (/\.{4,}|…{2,}/.test(m[2].slice(0, 200)) || !/^[\p{L}"“(]/u.test(m[2])) continue;   // içindekiler satırı
+        scope = { v: sentenceCut(m[2], 700), head: m[1], src: { name: d.name, type: d.type, page: pageAt(d, m.index) } };
+        break outer;
+      }
+    }
+    // Öne çıkan zorunlu gereksinim cümleleri
+    const domFold = terms.map(fold);
+    const reqs = [];
+    for (const d of tech) {
+      const sents = d._flat.split(/(?<=[.;])\s+(?=[A-ZÇĞİÖŞÜ0-9])/u);
+      let off = 0;
+      for (const s of sents) {
+        const idx = d._flat.indexOf(s, off); off = idx + s.length;
+        if (s.length < 40 || s.length > 320) continue;
+        if (!/(olmalıdır|olacaktır|edilecektir|zorunludur|sağlanacaktır|mecburidir|gerekmektedir|yapılacaktır|istenmektedir)/.test(s)) continue;
+        const sf = fold(s);
+        const hits = domFold.filter((k) => sf.includes(k)).length;
+        if (!hits) continue;
+        reqs.push({ v: clean(s), score: hits + (/\d/.test(s) ? 0.5 : 0), src: { name: d.name, type: d.type, page: pageAt(d, idx) } });
+      }
+    }
+    reqs.sort((a, b) => b.score - a.score);
+    const seenR = new Set();
+    const requirements = reqs.filter((r) => { const k = fold(r.v).slice(0, 60); if (seenR.has(k)) return false; seenR.add(k); return true; }).slice(0, 10);
+    return { kw, standards, brands, muadil, quantities, heads, scope, title, requirements, techDocs: tech.length };
+  }
+
+  // ---------- Özet ----------
+  function parseTrDate(s) {
+    const m = String(s || "").match(/(\d{1,2})[./](\d{1,2})[./](\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+    return m ? new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 23), +(m[5] || 59)) : null;
+  }
+  function buildSummary(docs, tender, userKw) {
+    docs.forEach((d) => { delete d._flat; delete d._lines; });
+    const fields = extractFields(docs);
+    const items = parseItems(docs);
+    const tech = techAnalysis(docs, userKw);
+    if (!fields.isAdi && tech.title) fields.isAdi = tech.title;
+    const present = new Set(docs.map((d) => d.type));
+    const missing = ["idari", "teknik", "cetvel", "sozlesme"].filter((t) => !present.has(t));
+    if (missing.includes("cetvel") && items.length) missing.splice(missing.indexOf("cetvel"), 1);
+    const scanned = docs.filter((d) => d.scanned && !d.error).map((d) => d.name);
+    const failed = docs.filter((d) => d.error).map((d) => ({ name: d.name, error: d.error }));
+
+    const tDate = parseTrDate(fields.tarih?.v) || (tender.tenderDate ? new Date(tender.tenderDate) : null);
+    const daysTo = tDate ? Math.ceil((tDate - Date.now()) / 864e5) : null;
+    const flags = [];
+    const flag = (level, text) => flags.push({ level, text });
+    if (daysTo != null && daysTo >= 0) {
+      const aGun = fields.aciklamaGun?.v || 10;
+      const aDate = new Date(tDate.getTime() - aGun * 864e5);
+      if (daysTo <= aGun) flag("warn", `İhaleye ${daysTo} gün kaldı; açıklama talebi süresi (ihaleden ${aGun} gün önce) geçmiş olabilir.`);
+      else flag("info", `Açıklama talebi için son gün yaklaşık ${aDate.toLocaleDateString("tr-TR")} (ihaleden ${aGun} gün önce).`);
+      if (daysTo <= 7) flag("warn", `Teklif hazırlığı için ${daysTo} gün var.`);
+    }
+    if (fields.eteklif) flag("info", "Teklif EKAP üzerinden e-teklif olarak verilecek — e-imza ve EKAP kaydı hazır olmalı.");
+    if (tech.brands.length && !tech.muadil) flag("warn", `Teknik dokümanda marka adı geçiyor (${tech.brands.slice(0, 4).map((b) => b.k).join(", ")}) ama "muadil/eşdeğer" ifadesi bulunamadı — rekabeti kısıtlayan şartname olabilir, açıklama talebi değerlendir.`);
+    else if (tech.brands.length) flag("info", `Markalar: ${tech.brands.slice(0, 5).map((b) => b.k).join(", ")} (muadil ifadesi ${tech.muadil} yerde geçiyor).`);
+    const dp = fields.deneyim ? parseFloat(fields.deneyim.v.replace(/[^\d]/g, "")) : null;
+    if (dp != null && dp >= 50) flag("warn", `İş deneyim oranı yüksek (${fields.deneyim.v}); referansların yeterli mi kontrol et.`);
+    if (fields.fiyatFarki?.v === "Verilmeyecek") flag("info", "Fiyat farkı verilmeyecek — kur/malzeme artışı riskini teklife yansıt.");
+    if (fields.kismi?.v === "Verilebilir") flag("info", "Kısmi teklif verilebilir — yalnızca uzmanlık alanındaki kısımlara teklif verme imkânı.");
+    if (fields.yerli) flag("info", `Yerli istekli/yerli malı lehine ${fields.yerli.v} uygulanıyor.`);
+    if (fields.altYuk && /(yaptırılamaz|verilemez|çalıştırılamaz|izin verilmemektedir)/.test(fields.altYuk.v)) flag("warn", "Alt yüklenici kullanımı kısıtlanmış.");
+    if (scanned.length) flag("warn", `${scanned.length} belge taranmış görüntü; metni okunamadı (${scanned.slice(0, 3).join(", ")}${scanned.length > 3 ? "…" : ""}). Yapay zekâ özeti bu belgeleri görsel olarak okuyabilir.`);
+    if (missing.length) flag("warn", `Bulunamayan doküman: ${missing.map((t) => TYPES[t]).join(", ")}.`);
+    if (failed.length) flag("warn", `${failed.length} dosya okunamadı: ${failed.slice(0, 3).map((x) => x.name).join(", ")}.`);
+
+    // Genel özet paragrafı
+    const g = [];
+    const idare = fields.idare?.v || tender.authority || "";
+    const isAdi = fields.isAdi?.v || tender.title || "";
+    g.push(`${idare ? idare + " tarafından " : ""}${fields.tur ? fields.tur.v.toLocaleLowerCase("tr-TR") + " kapsamında " : ""}“${isAdi}” ihalesi${fields.usul ? " (" + fields.usul.v + ")" : ""}.`);
+    const when = fields.tarih?.v || (tDate ? tDate.toLocaleString("tr-TR", { dateStyle: "long", timeStyle: "short" }) : "");
+    if (when) g.push(`İhale tarihi ${when}${fields.eteklif ? ", teklifler EKAP'tan e-teklif olarak verilecek" : ""}.`);
+    if (fields.yer) g.push(`İşin yapılacağı/teslim yeri: ${fields.yer.v}.`);
+    const sure = fields.sure?.v || fields.teslimSure?.v;
+    if (sure) g.push(`Süre: ${cut(sure, 180)}.`);
+    if (items.length) {
+      const top = items.slice(0, 4).map((i) => `${i.name} (${fmtQty(i.qty)} ${i.unit})`.trim()).join("; ");
+      g.push(`Kalem listesinde ${items.length} kalem var${top ? ": " + top + (items.length > 4 ? " …" : "") : ""}.`);
+    } else if (fields.kalemIlan) g.push(`İdari şartnameye göre ${fields.kalemIlan.v} kalem.`);
+    if (tech.scope) g.push(`Kapsam: ${cut(tech.scope.v, 320)}`);
+    else if (fields.miktar) g.push(`Miktar ve tür: ${cut(fields.miktar.v, 240)}`);
+    if (tech.kw.length) g.push(`Teknik şartnamede öne çıkanlar: ${tech.kw.slice(0, 6).map((x) => x.k).join(", ")}${tech.standards.length ? "; standartlar: " + tech.standards.slice(0, 5).map((s) => s.k).join(", ") : ""}.`);
+    const mali = [fields.deneyim && `iş deneyimi ${fields.deneyim.v}`, fields.gecici && `geçici teminat ${fields.gecici.v}`, fields.sozTuru && fields.sozTuru.v.toLocaleLowerCase("tr-TR"),
+      fields.fiyatFarki && `fiyat farkı ${fields.fiyatFarki.v.toLocaleLowerCase("tr-TR")}`, fields.kismi && `kısmi teklif ${fields.kismi.v.toLocaleLowerCase("tr-TR")}`].filter(Boolean);
+    if (mali.length) g.push(`Şartlar: ${mali.join(", ")}.`);
+
+    return {
+      at: new Date().toISOString(),
+      genel: g.map((s) => (/[.…!?]$/.test(s) ? s : s + ".")).join(" ").replace(/\.\./g, "."),
+      fields, items, tech, flags, missing, scanned, failed,
+      counts: Object.fromEntries(TYPE_ORDER.map((t) => [t, docs.filter((d) => d.type === t).length]))
+    };
+  }
+
+  // ---------- Kalıcılık ----------
+  const safeName = (s) => fold(s).replace(/[^a-z0-9.\-]+/g, "_").replace(/_+/g, "_").slice(-90);
+  function localKey(id) { return "tr.proje." + id; }
+  async function loadRecord(ctx) {
+    const id = ctx.tender.id;
+    if (ctx.cloud) {
+      const { data, error } = await ctx.cloud.from("proje_ozet").select("files,texts,summary,ai,updated_at").eq("tender_id", id).maybeSingle();
+      if (error) { const e = new Error(error.message); e.missingTable = /proje_ozet|relation|schema cache|does not exist/i.test(error.message); throw e; }
+      return data ? { files: data.files || [], texts: data.texts || {}, summary: data.summary, ai: data.ai, updated_at: data.updated_at } : { files: [], texts: {} };
+    }
+    try { return JSON.parse(localStorage.getItem(localKey(id))) || { files: [], texts: {} }; } catch { return { files: [], texts: {} }; }
+  }
+  async function saveRecord(ctx, rec) {
+    const t = ctx.tender;
+    const row = {
+      tender_id: t.id,
+      tender: { title: t.title, authority: t.authority, ikn: t.ikn || null, tenderDate: t.tenderDate || null, city: t.city || null },
+      files: rec.files, texts: rec.texts, summary: rec.summary || null, ai: rec.ai || null, updated_at: new Date().toISOString()
+    };
+    if (ctx.cloud) {
+      row.user_id = ctx.cloud.user.id;
+      const { error } = await ctx.cloud.from("proje_ozet").upsert(row, { onConflict: "user_id,tender_id" });
+      if (error) throw new Error(error.message);
+    } else {
+      try { localStorage.setItem(localKey(t.id), JSON.stringify(row)); }
+      catch { localStorage.setItem(localKey(t.id), JSON.stringify({ ...row, texts: {} })); }
+    }
+    ctx.onSaved && ctx.onSaved(t.id, row);
+  }
+
+  // ---------- Yapay zekâ özeti (kullanıcının kendi Claude API anahtarıyla) ----------
+  const S = (d) => ({ type: "string", description: d });
+  const A = (d) => ({ type: "array", items: { type: "string" }, description: d });
+  const AI_SCHEMA = {
+    type: "object", additionalProperties: false,
+    required: ["genel_ozet", "kunye", "kapsam", "ana_kalemler", "teknik_gereksinimler", "yeterlik_ve_mali_sartlar", "riskler", "sorulacak_sorular", "eksik_veya_belirsiz"],
+    properties: {
+      genel_ozet: S("Projenin 5-8 cümlelik genel özeti: ne alınıyor/yapılıyor, nerede, ne zaman, ölçeği ve öne çıkan özellikleri"),
+      kunye: {
+        type: "object", additionalProperties: false,
+        required: ["idare", "isin_adi", "ihale_turu_usulu", "ihale_tarihi", "yer", "sure", "sozlesme_turu", "kalem_sayisi"],
+        properties: {
+          idare: S("İdare adı"), isin_adi: S("İşin adı"), ihale_turu_usulu: S("Mal/hizmet/yapım ve ihale usulü"), ihale_tarihi: S("İhale tarihi ve saati"),
+          yer: S("İşin yapılacağı / teslim yeri"), sure: S("İşin/teslim süresi"), sozlesme_turu: S("Birim fiyat / götürü bedel vb."), kalem_sayisi: S("Kalem sayısı ve kısa açıklama")
+        }
+      },
+      kapsam: A("İşin kapsamındaki ana iş paketleri, kısa maddeler"),
+      ana_kalemler: {
+        type: "array", description: "Kalem listesindeki en önemli kalemler (en fazla 15)",
+        items: { type: "object", additionalProperties: false, required: ["ad", "miktar", "birim"], properties: { ad: S("Kalem adı"), miktar: S("Miktar"), birim: S("Birim") } }
+      },
+      teknik_gereksinimler: A("Teklifi doğrudan etkileyen teknik gereksinimler (protokoller, standartlar, donanım/yazılım, test, eğitim, garanti)"),
+      yeterlik_ve_mali_sartlar: A("İş deneyimi, benzer iş, teminatlar, fiyat farkı, avans, ceza, ödeme şartları"),
+      riskler: A("Teklif veren firma açısından riskler ve dikkat edilmesi gerekenler"),
+      sorulacak_sorular: A("İdareye açıklama talebi olarak sorulabilecek belirsizlikler"),
+      eksik_veya_belirsiz: A("Dokümanlarda bulunamayan veya çelişkili bilgiler")
+    }
+  };
+  const AI_SYSTEM = `Sen, SCADA, otomasyon ve enerji dağıtım projelerine teklif veren bir firmada kıdemli ihale/iş geliştirme uzmanısın.
+Sana bir ihalenin dokümanları (idari şartname, teknik şartname, birim fiyat cetveli, sözleşme tasarısı vb.) verilecek.
+Görevin, teklif verip vermemeye karar verecek ve teklifi hazırlayacak ekip için tüm dokümanları birlikte değerlendirip Türkçe bir proje özeti çıkarmak.
+Yalnızca dokümanlarda yazanlara dayan; bilgi yoksa "Belirtilmemiş" yaz, tahmin etme. Önemli bilginin hangi dokümandan geldiğini gerektiğinde parantez içinde kısaca belirt (ör. "(Teknik Ş. md. 4.2)").
+Kısa ve net yaz; maddeler tek cümle olsun.`;
+
+  async function runAi(ctx, rec, mem, onProgress) {
+    const key = localStorage.getItem(KEY_STORE);
+    if (!key) throw new Error("Claude API anahtarı girilmemiş");
+    const { default: Anthropic } = await import(LIB.sdk);
+    const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
+    const t = ctx.tender;
+    const content = [];
+    const files = [...rec.files].sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
+    let pdfBytes = 0;
+    for (const f of files) {
+      if (f.type === "form") continue;
+      const txt = rec.texts[f.id];
+      if (f.scanned && f.ext === "pdf" && f.size < 20e6 && pdfBytes + f.size < 25e6) {
+        const blob = mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null);
+        if (blob) {
+          const b64 = await blobToBase64(blob);
+          pdfBytes += f.size;
+          content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 }, title: `${TYPES[f.type]} — ${f.name}` });
+          continue;
+        }
+      }
+      if (txt) content.push({ type: "text", text: `### ${TYPES[f.type]} — ${f.name}\n\n${txt}` });
+    }
+    if (!content.length) throw new Error("Yapay zekâya gönderilecek okunabilir doküman yok");
+    content.push({ type: "text", text: `İhale: ${t.title}\nİdare: ${t.authority}${t.ikn ? "\nİKN: " + t.ikn : ""}${t.tenderDate ? "\nPanelde kayıtlı ihale tarihi: " + new Date(t.tenderDate).toLocaleString("tr-TR") : ""}\n\nYukarıdaki dokümanların tamamını inceleyip proje özetini istenen yapıda hazırla.` });
+
+    const stream = client.beta.messages.stream({
+      model: AI_MODEL,
+      max_tokens: 32000,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      thinking: { type: "adaptive" },
+      output_config: { effort: "medium", format: { type: "json_schema", schema: AI_SCHEMA } },
+      system: AI_SYSTEM,
+      messages: [{ role: "user", content }]
+    });
+    let chars = 0;
+    stream.on("text", (d) => { chars += d.length; onProgress && onProgress(`Yapay zekâ yazıyor… ${chars.toLocaleString("tr-TR")} karakter`); });
+    const msg = await stream.finalMessage();
+    if (msg.stop_reason === "refusal") throw new Error("Model bu isteği yanıtlamadı (refusal)");
+    if (msg.stop_reason === "max_tokens") throw new Error("Yanıt uzunluk sınırına takıldı; tekrar dene");
+    const txt = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    let out;
+    try { out = JSON.parse(txt); } catch { throw new Error("Yapay zekâ yanıtı okunamadı"); }
+    const u = msg.usage || {};
+    const cost = ((u.input_tokens || 0) * 4 + (u.output_tokens || 0) * 20) / 1e6;
+    return { ...out, model: msg.model, at: new Date().toISOString(), usage: { input: u.input_tokens, output: u.output_tokens, costUsd: Math.round(cost * 100) / 100 } };
+  }
+  function blobToBase64(blob) {
+    return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = rej; r.readAsDataURL(blob); });
+  }
+  async function downloadBlob(ctx, path) {
+    const { data, error } = await ctx.cloud.storage(BUCKET).download(path);
+    if (error) return null;
+    return data;
+  }
+
+  // ---------- Arayüz ----------
+  function srcChip(src) {
+    if (!src) return "";
+    const short = { idari: "İdari Ş.", teknik: "Teknik Ş.", cetvel: "Cetvel", sozlesme: "Sözleşme", ilan: "İlan", zeyil: "Zeyilname", form: "Form", diger: "Doküman" }[src.type] || "Doküman";
+    return `<span class="src-chip" title="${esc(src.name)}${src.page ? " · sayfa " + src.page : ""}">${short}${src.page ? " s." + src.page : ""}</span>`;
+  }
+  const kvRow = (label, f, fallback) => (f || fallback) ? `<dt>${label}</dt><dd>${f ? esc(f.v) + " " + srcChip(f.src) : `<span class="muted">${esc(fallback)}</span>`}</dd>` : "";
+  const fmtSize = (n) => (n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
+
+  function mount(root, ctx) {
+    const st = { rec: null, busy: "", error: null, mem: new Map(), showAllItems: false, aiErr: null };
+    const t = ctx.tender;
+
+    async function init() {
+      root.innerHTML = `<p class="muted">Proje kaydı yükleniyor…</p>`;
+      try { st.rec = await loadRecord(ctx); }
+      catch (e) {
+        root.innerHTML = e.missingTable
+          ? `<div class="card card-pad"><h3>Kurulum gerekiyor</h3><p class="small">Proje özetleri için Supabase'de <code>supabase/guncelleme-4.sql</code> dosyasının bir kez çalıştırılması gerekiyor
+             (Supabase → SQL Editor → New query → dosya içeriğini yapıştır → Run). Sonra bu sayfayı yenile.</p></div>`
+          : `<div class="card card-pad"><p>Kayıt yüklenemedi: ${esc(e.message)}</p></div>`;
+        return;
+      }
+      draw();
+    }
+
+    function draw() {
+      const rec = st.rec;
+      const s = rec.summary;
+      root.innerHTML = `
+        <div class="card card-pad proje-docs">
+          <div class="proje-docs-head">
+            <h3 style="margin:0">Dokümanlar <span class="muted small">${rec.files.length || ""}</span></h3>
+            ${rec.files.length ? `<button class="btn small" data-p="reanalyze" type="button" ${st.busy ? "disabled" : ""}>↻ Yeniden analiz et</button>` : ""}
+          </div>
+          <label class="dropzone ${st.busy ? "busy" : ""}" id="pDrop">
+            <input type="file" id="pFile" multiple accept=".zip,.pdf,.docx,.doc,.xlsx,.xls,.xlsm,.ods,.csv,.txt,.htm,.html" hidden ${st.busy ? "disabled" : ""}>
+            <b>${st.busy ? esc(st.busy) : "Dokümanları buraya sürükle ya da tıklayıp seç"}</b>
+            <span class="muted small">${st.busy ? "" : "EKAP'tan indirdiğin ZIP'i olduğu gibi bırakabilirsin; PDF, Word, Excel de olur. İdari + teknik şartname + birim fiyat cetveli + sözleşme tasarısı birlikte en iyi sonucu verir."}</span>
+          </label>
+          ${t.ekapUrl ? `<p class="muted small" style="margin:8px 0 0">EKAP'ta: <a href="${esc(t.ekapUrl)}" target="_blank" rel="noopener">ihaleyi aç ↗</a> → <b>İhale Dokümanı</b> → indir (e-imza/EKAP girişi gerekebilir) → indirilen ZIP'i buraya bırak.</p>` : ""}
+          ${st.error ? `<p class="small" style="color:var(--urgent);margin:8px 0 0">${esc(st.error)}</p>` : ""}
+          ${rec.files.length ? `<div class="table-wrap" style="margin-top:12px"><table class="table small">
+            <thead><tr><th>Dosya</th><th>Tür</th><th>Sayfa</th><th>Metin</th><th></th></tr></thead>
+            <tbody>${rec.files.map((f) => `<tr>
+              <td>${f.storagePath && ctx.cloud ? `<a href="#" data-p="open" data-id="${esc(f.id)}">${esc(f.name)}</a>` : esc(f.name)}${f.path !== f.name ? `<div class="muted" style="font-size:11px">${esc(f.path)}</div>` : ""}</td>
+              <td><select data-ptype="${esc(f.id)}">${TYPE_ORDER.map((k) => `<option value="${k}" ${f.type === k ? "selected" : ""}>${TYPES[k]}</option>`).join("")}</select></td>
+              <td>${f.pages || "—"}</td>
+              <td>${f.error ? `<span style="color:var(--urgent)" title="${esc(f.error)}">okunamadı</span>` : f.scanned ? `<span style="color:var(--week)" title="Metin katmanı yok (taranmış görüntü)">taranmış</span>` : `${(f.chars || 0) < 1000 ? (f.chars || 0) + " kr." : Math.round(f.chars / 1000) + "k kr."}${f.truncated ? " (kısaltıldı)" : ""}${f.approx ? " ~" : ""}`}</td>
+              <td><button class="btn ghost small" data-p="del" data-id="${esc(f.id)}" title="Dosyayı kaldır" type="button">✕</button></td></tr>`).join("")}</tbody></table></div>` : ""}
+        </div>
+        ${s ? summaryHtml(s) : rec.files.length ? "" : `<div class="card card-pad"><p class="muted" style="margin:0">Dokümanları yükleyince ihale künyesi, kapsam, kalem listesi, teknik öne çıkanlar, yeterlik/mali şartlar ve dikkat edilecekler burada oluşur.</p></div>`}
+        ${rec.files.length ? aiHtml() : ""}`;
+    }
+
+    function summaryHtml(s) {
+      const f = s.fields, tech = s.tech, items = s.items || [];
+      const shown = st.showAllItems ? items : items.slice(0, 15);
+      return `
+        <div class="card card-pad proje-sum">
+          <div class="proje-docs-head"><h3 style="margin:0">Proje özeti</h3>
+            <div style="display:flex;gap:6px"><button class="btn small" data-p="copy" type="button">⧉ Kopyala</button><button class="btn small" data-p="print" type="button">🖨 Yazdır</button></div></div>
+          <div class="summary-box" style="margin-top:10px"><b>Genel özet</b>${esc(s.genel)}</div>
+          ${s.flags.length ? `<ul class="flag-list">${s.flags.map((x) => `<li class="${x.level}">${esc(x.text)}</li>`).join("")}</ul>` : ""}
+          <div class="proje-grid">
+            <section><h4>Künye</h4><dl class="kv">
+              ${kvRow("İdare", f.idare, t.authority)}
+              ${kvRow("İşin adı", f.isAdi, t.title)}
+              ${kvRow("Tür", f.tur)}
+              ${kvRow("Usul", f.usul)}
+              ${kvRow("İhale tarihi", f.tarih, t.tenderDate ? new Date(t.tenderDate).toLocaleString("tr-TR", { dateStyle: "medium", timeStyle: "short" }) + " (ilandan)" : "")}
+              ${kvRow("Teklif", f.eteklif)}
+              ${kvRow("Teslim / iş yeri", f.yer, t.city || "")}
+              ${kvRow("Süre", f.sure || f.teslimSure)}
+              ${kvRow("Sözleşme türü", f.sozTuru)}
+              ${kvRow("Kısmi teklif", f.kismi)}
+              ${kvRow("Miktar ve tür", f.miktar)}
+              ${t.ikn ? `<dt>İKN</dt><dd>${esc(t.ikn)}</dd>` : ""}
+            </dl></section>
+            <section><h4>Yeterlik ve mali şartlar</h4><dl class="kv">
+              ${kvRow("İş deneyimi", f.deneyim)}
+              ${kvRow("Benzer iş", f.benzerIs)}
+              ${kvRow("Geçici teminat", f.gecici)}
+              ${kvRow("Kesin teminat", f.kesin)}
+              ${kvRow("Fiyat farkı", f.fiyatFarki)}
+              ${kvRow("Avans", f.avans)}
+              ${kvRow("Yerli avantajı", f.yerli)}
+              ${kvRow("Sınır değer (N)", f.sinir)}
+              ${kvRow("Teklif geçerliliği", f.gecerlilik)}
+              ${kvRow("Gecikme cezası", f.ceza)}
+              ${kvRow("Alt yüklenici", f.altYuk)}
+            </dl>${["deneyim", "gecici", "fiyatFarki", "benzerIs"].some((k) => f[k]) ? "" : `<p class="muted small">İdari şartname yüklenmediği ya da okunamadığı için bu alanlar boş.</p>`}</section>
+          </div>
+          <section style="margin-top:18px"><h4>Kapsam ${tech.scope ? srcChip(tech.scope.src) : ""}</h4>
+            ${tech.scope ? `<p class="small" style="margin:0 0 10px;line-height:1.6">${esc(tech.scope.v)}</p>` : `<p class="muted small">Teknik şartnamede kapsam bölümü bulunamadı.</p>`}
+            ${tech.heads.length ? `<details><summary class="small">Teknik şartname başlıkları (${tech.heads.length})</summary><ol class="small heads">${tech.heads.map((h) => `<li>${esc(h)}</li>`).join("")}</ol></details>` : ""}
+          </section>
+          <section style="margin-top:18px"><h4>Kalem listesi ${items.length ? `<span class="muted small">${items.length} kalem</span>` : ""}</h4>
+            ${items.length ? `<div class="table-wrap"><table class="table small"><thead><tr><th>No</th><th>Kalem</th><th style="text-align:right">Miktar</th><th>Birim</th></tr></thead><tbody>
+              ${shown.map((i) => `<tr><td>${esc(i.no)}</td><td>${esc(i.name)}</td><td style="text-align:right">${esc(fmtQty(i.qty))}</td><td>${esc(i.unit)}</td></tr>`).join("")}</tbody></table></div>
+              ${items.length > 15 ? `<button class="btn ghost small" data-p="items" type="button">${st.showAllItems ? "Daha az göster" : `Tüm ${items.length} kalemi göster`}</button>` : ""}`
+              : `<p class="muted small">${f.kalemIlan ? `İdari şartnameye göre ${esc(f.kalemIlan.v)} kalem; ` : ""}birim fiyat teklif cetveli / mal listesi yüklenmedi ya da tablo okunamadı.</p>`}
+            ${tech.quantities.length ? `<p class="small" style="margin:10px 0 4px"><b>Metinde geçen miktarlar:</b></p><div class="chip-row">${tech.quantities.map((q) => `<span class="tag">${esc(q.qty)} × ${esc(q.name)}</span>`).join("")}</div>` : ""}
+          </section>
+          <section style="margin-top:18px"><h4>Teknik öne çıkanlar ${tech.techDocs ? "" : `<span class="muted small">(teknik şartname yok — diğer dokümanlardan)</span>`}</h4>
+            ${tech.kw.length ? `<div class="chip-row">${tech.kw.map((x) => `<span class="tag">${esc(x.k)} <b>${x.n}</b></span>`).join("")}</div>` : `<p class="muted small">Alan anahtar kelimesi bulunamadı.</p>`}
+            ${tech.standards.length ? `<p class="small" style="margin:10px 0 4px"><b>Standartlar:</b> ${tech.standards.map((x) => esc(x.k)).join(", ")}</p>` : ""}
+            ${tech.brands.length ? `<p class="small" style="margin:6px 0 4px"><b>Markalar:</b> ${tech.brands.map((x) => `${esc(x.k)} (${x.n})`).join(", ")} · muadil/eşdeğer ifadesi: ${tech.muadil}</p>` : ""}
+            <dl class="kv" style="margin-top:8px">
+              ${kvRow("Garanti", f.garanti)}${kvRow("Eğitim", f.egitim)}${kvRow("Testler", f.fat || f.sat ? { v: [f.fat && "FAT", f.sat && "SAT"].filter(Boolean).join(" + "), src: (f.fat || f.sat).src } : null)}${kvRow("Yedek parça", f.yedek)}
+            </dl>
+            ${tech.requirements.length ? `<details open><summary class="small">Öne çıkan gereksinimler</summary><ul class="small reqs">${tech.requirements.map((r) => `<li>${esc(r.v)} ${srcChip(r.src)}</li>`).join("")}</ul></details>` : ""}
+          </section>
+          <p class="muted small" style="margin:14px 0 0">Kural tabanlı otomatik çıkarım — ${new Date(s.at).toLocaleString("tr-TR")}. Rakamları teklif öncesinde dokümandan teyit et; kaynak etiketinin üzerine gelince dosya adı ve sayfa görünür.</p>
+        </div>`;
+    }
+
+    function aiHtml() {
+      const ai = st.rec.ai;
+      const hasKey = !!localStorage.getItem(KEY_STORE);
+      const chars = st.rec.files.filter((f) => f.type !== "form").reduce((a, f) => a + (st.rec.texts[f.id] || "").length, 0);
+      const estIn = Math.round(chars / 3);
+      const estCost = (estIn * 4 + 6000 * 20) / 1e6;
+      const L = (title, arr) => arr && arr.length ? `<section><h4>${title}</h4><ul class="small">${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : "";
+      return `
+        <div class="card card-pad" id="aiCard">
+          <div class="proje-docs-head"><h3 style="margin:0">Yapay zekâ ile detaylı özet <span class="muted small">Claude</span></h3>
+            ${hasKey ? `<button class="btn small ${ai ? "" : "primary"}" data-p="ai" type="button" ${st.busy ? "disabled" : ""}>${ai ? "↻ Yeniden oluştur" : "🤖 Özet oluştur"}</button>` : ""}</div>
+          ${hasKey ? `<p class="muted small" style="margin:6px 0 0">Tüm dokümanlar birlikte okunur (≈ ${estIn.toLocaleString("tr-TR")} token, tahmini maliyet ≈ $${estCost.toFixed(2)}). Taranmış PDF'ler görsel olarak okunur.
+              <a href="#" data-p="key-clear">Anahtarı bu cihazdan sil</a></p>`
+            : `<p class="small" style="margin:6px 0 8px">Kural tabanlı özete ek olarak dokümanları gerçekten okuyup yorumlayan bir özet (kapsam, riskler, açıklama talebi soruları) için kendi <b>Claude API anahtarını</b> gir.
+                Anahtar yalnızca bu tarayıcıda saklanır, sunucuya/veritabanına yazılmaz. Anahtarı <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> → API Keys'ten alabilirsin (kullandıkça ücretlendirilir).</p>
+               <form class="kw-add" data-pform="key"><input class="input" name="key" type="password" autocomplete="off" placeholder="sk-ant-…" style="flex:1"><button class="btn primary" type="submit">Kaydet</button></form>`}
+          ${st.aiErr ? `<p class="small" style="color:var(--urgent);margin:8px 0 0">${esc(st.aiErr)}</p>` : ""}
+          ${ai ? `
+            <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${esc(ai.genel_ozet)}</div>
+            <div class="proje-grid">
+              <section><h4>Künye</h4><dl class="kv">${Object.entries({ idare: "İdare", isin_adi: "İşin adı", ihale_turu_usulu: "Tür / usul", ihale_tarihi: "İhale tarihi", yer: "Yer", sure: "Süre", sozlesme_turu: "Sözleşme türü", kalem_sayisi: "Kalemler" })
+                .map(([k, l]) => ai.kunye && ai.kunye[k] ? `<dt>${l}</dt><dd>${esc(ai.kunye[k])}</dd>` : "").join("")}</dl></section>
+              ${L("Kapsam", ai.kapsam)}
+            </div>
+            ${ai.ana_kalemler && ai.ana_kalemler.length ? `<section style="margin-top:12px"><h4>Ana kalemler</h4><div class="table-wrap"><table class="table small"><thead><tr><th>Kalem</th><th style="text-align:right">Miktar</th><th>Birim</th></tr></thead><tbody>
+              ${ai.ana_kalemler.map((i) => `<tr><td>${esc(i.ad)}</td><td style="text-align:right">${esc(i.miktar)}</td><td>${esc(i.birim)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+            <div class="proje-grid" style="margin-top:12px">
+              ${L("Teknik gereksinimler", ai.teknik_gereksinimler)}
+              ${L("Yeterlik ve mali şartlar", ai.yeterlik_ve_mali_sartlar)}
+              ${L("Riskler / dikkat", ai.riskler)}
+              ${L("Açıklama talebi için sorular", ai.sorulacak_sorular)}
+              ${L("Eksik veya belirsiz", ai.eksik_veya_belirsiz)}
+            </div>
+            <p class="muted small" style="margin:10px 0 0">${esc(ai.model || "")} · ${new Date(ai.at).toLocaleString("tr-TR")}${ai.usage ? ` · ${(ai.usage.input || 0).toLocaleString("tr-TR")} + ${(ai.usage.output || 0).toLocaleString("tr-TR")} token ≈ $${ai.usage.costUsd}` : ""}. Yapay zekâ hata yapabilir; kritik bilgileri dokümandan teyit et.</p>` : ""}
+        </div>`;
+    }
+
+    function summaryText() {
+      const s = st.rec.summary; if (!s) return "";
+      const f = s.fields, L = [];
+      L.push(`PROJE ÖZETİ — ${t.title}`, `${t.authority}${t.ikn ? " · İKN " + t.ikn : ""}`, "", s.genel, "");
+      const kv = [["İhale tarihi", f.tarih], ["Tür", f.tur], ["Usul", f.usul], ["Yer", f.yer], ["Süre", f.sure || f.teslimSure], ["Sözleşme türü", f.sozTuru], ["Kısmi teklif", f.kismi],
+        ["İş deneyimi", f.deneyim], ["Benzer iş", f.benzerIs], ["Geçici teminat", f.gecici], ["Fiyat farkı", f.fiyatFarki], ["Avans", f.avans], ["Gecikme cezası", f.ceza], ["Garanti", f.garanti]];
+      kv.forEach(([k, v]) => v && L.push(`${k}: ${v.v}`));
+      if (s.items.length) { L.push("", `Kalemler (${s.items.length}):`); s.items.slice(0, 30).forEach((i) => L.push(`- ${i.name} — ${fmtQty(i.qty)} ${i.unit}`)); }
+      if (s.flags.length) { L.push("", "Dikkat:"); s.flags.forEach((x) => L.push("- " + x.text)); }
+      const ai = st.rec.ai;
+      if (ai) {
+        L.push("", "YAPAY ZEKÂ ÖZETİ", ai.genel_ozet);
+        [["Kapsam", ai.kapsam], ["Teknik gereksinimler", ai.teknik_gereksinimler], ["Riskler", ai.riskler], ["Sorular", ai.sorulacak_sorular]].forEach(([k, a]) => { if (a && a.length) { L.push("", k + ":"); a.forEach((x) => L.push("- " + x)); } });
+      }
+      return L.join("\n");
+    }
+
+    function recompute() {
+      const docs = st.rec.files.map((f) => ({ ...f, text: st.rec.texts[f.id] || "" }));
+      st.rec.summary = buildSummary(docs, t, ctx.keywords);
+    }
+
+    async function addFiles(list) {
+      if (!list.length || st.busy) return;
+      st.error = null;
+      const setBusy = (m) => { st.busy = m; const b = root.querySelector("#pDrop b"); if (b) b.textContent = m; };
+      setBusy("Dosyalar okunuyor…"); draw();
+      try {
+        const docs = await extractFiles([...list], setBusy);
+        // Aynı ad + boyuttaki eski kayıtların yerine geçer
+        for (const d of docs) {
+          const old = st.rec.files.find((f) => f.name === d.name && f.size === d.size);
+          if (old) { st.rec.files = st.rec.files.filter((f) => f !== old); delete st.rec.texts[old.id]; }
+          if (ctx.cloud && d.size <= MAX_UPLOAD) {
+            setBusy(`Yükleniyor: ${d.name}`);
+            const path = `${ctx.cloud.user.id}/${safeName(t.id)}/${d.id}-${safeName(d.name)}`;
+            const { error } = await ctx.cloud.storage(BUCKET).upload(path, d.blob, { upsert: true, contentType: d.blob.type || "application/octet-stream" });
+            if (!error) d.storagePath = path;
+            else st.error = `Bazı dosyalar depoya yüklenemedi (${error.message}); özet yine de oluşturuldu.`;
+          }
+          st.mem.set(d.id, d.blob);
+          st.rec.texts[d.id] = d.text;
+          const { blob, text, _flat, _lines, ...meta } = d;
+          st.rec.files.push(meta);
+        }
+        st.rec.files.sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
+        setBusy("Analiz ediliyor…");
+        recompute();
+        setBusy("Kaydediliyor…");
+        await saveRecord(ctx, st.rec);
+        ctx.toast && ctx.toast(`${docs.length} doküman işlendi — proje özeti hazır`);
+      } catch (e) { st.error = "İşlem tamamlanamadı: " + (e.message || e); }
+      st.busy = ""; draw();
+    }
+
+    async function persist(msg) {
+      try { await saveRecord(ctx, st.rec); if (msg) ctx.toast && ctx.toast(msg); }
+      catch (e) { st.error = "Kaydedilemedi: " + e.message; }
+      draw();
+    }
+
+    root.addEventListener("click", async (e) => {
+      const el = e.target.closest("[data-p]");
+      if (!el) return;
+      const a = el.dataset.p;
+      if (a === "open") {
+        e.preventDefault();
+        const f = st.rec.files.find((x) => x.id === el.dataset.id);
+        if (!f) return;
+        const blob = st.mem.get(f.id);
+        if (blob) { window.open(URL.createObjectURL(f.ext === "pdf" ? new Blob([blob], { type: "application/pdf" }) : blob), "_blank"); return; }
+        const { data, error } = await ctx.cloud.storage(BUCKET).createSignedUrl(f.storagePath, 3600, { download: f.ext !== "pdf" ? f.name : undefined });
+        if (error) { ctx.toast && ctx.toast("Dosya açılamadı: " + error.message); return; }
+        window.open(data.signedUrl, "_blank");
+      } else if (a === "del") {
+        const f = st.rec.files.find((x) => x.id === el.dataset.id);
+        if (!f || !confirm(`"${f.name}" kaldırılsın mı?`)) return;
+        if (ctx.cloud && f.storagePath) await ctx.cloud.storage(BUCKET).remove([f.storagePath]);
+        st.rec.files = st.rec.files.filter((x) => x !== f); delete st.rec.texts[f.id]; st.mem.delete(f.id);
+        if (st.rec.files.length) recompute(); else st.rec.summary = null;
+        persist("Dosya kaldırıldı");
+      } else if (a === "reanalyze") {
+        recompute(); persist("Yeniden analiz edildi");
+      } else if (a === "items") {
+        st.showAllItems = !st.showAllItems; draw();
+      } else if (a === "copy") {
+        navigator.clipboard?.writeText(summaryText()).then(() => ctx.toast && ctx.toast("Proje özeti panoya kopyalandı"), () => ctx.toast && ctx.toast("Kopyalanamadı"));
+      } else if (a === "print") {
+        window.print();
+      } else if (a === "key-clear") {
+        e.preventDefault(); localStorage.removeItem(KEY_STORE); draw();
+      } else if (a === "ai") {
+        st.aiErr = null; st.busy = "Yapay zekâ özeti hazırlanıyor…"; draw();
+        const status = () => root.querySelector("#aiCard .muted.small");
+        try {
+          st.rec.ai = await runAi(ctx, st.rec, st.mem, (m) => { const s = status(); if (s) s.textContent = m; });
+          await saveRecord(ctx, st.rec);
+          ctx.toast && ctx.toast("Yapay zekâ özeti hazır");
+        } catch (err) {
+          const m = String(err && err.message || err);
+          st.aiErr = /401|authentication|invalid x-api-key/i.test(m) ? "API anahtarı geçersiz. Anahtarı silip yeniden gir."
+            : /429|rate/i.test(m) ? "Hız sınırına takıldı; bir dakika sonra tekrar dene."
+            : /credit|billing|balance/i.test(m) ? "Anthropic hesabında kredi yok; console.anthropic.com → Billing."
+            : "Yapay zekâ özeti oluşturulamadı: " + m;
+        }
+        st.busy = ""; draw();
+      }
+    });
+    root.addEventListener("change", (e) => {
+      if (e.target.id === "pFile") { addFiles(e.target.files); return; }
+      const id = e.target.dataset.ptype;
+      if (id) { const f = st.rec.files.find((x) => x.id === id); if (f) { f.type = e.target.value; recompute(); persist("Doküman türü güncellendi"); } }
+    });
+    root.addEventListener("submit", (e) => {
+      if (e.target.dataset.pform !== "key") return;
+      e.preventDefault();
+      const v = String(new FormData(e.target).get("key") || "").trim();
+      if (!/^sk-ant-/.test(v)) { st.aiErr = "Anahtar \"sk-ant-\" ile başlamalı."; draw(); return; }
+      localStorage.setItem(KEY_STORE, v); st.aiErr = null; draw();
+    });
+    root.addEventListener("dragover", (e) => { if (e.target.closest("#pDrop")) { e.preventDefault(); e.target.closest("#pDrop").classList.add("over"); } });
+    root.addEventListener("dragleave", (e) => { const z = e.target.closest("#pDrop"); if (z) z.classList.remove("over"); });
+    root.addEventListener("drop", (e) => { const z = e.target.closest("#pDrop"); if (!z) return; e.preventDefault(); z.classList.remove("over"); addFiles(e.dataTransfer.files); });
+
+    init();
+    return { isBusy: () => !!st.busy };
+  }
+
+  window.TR_PROJE = { mount, core: { extractFiles, buildSummary, classify, TYPES } };
+})();

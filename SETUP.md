@@ -47,6 +47,13 @@ Supabase → SQL Editor → `supabase/guncelleme-3.sql` → **Run**. KİK'in her
 iptal ve düzeltme ilanları bir sonraki taramadan itibaren toplanır (arşiv her taramada 10 iş günü geriye dolar;
 hızlı doldurmak için Actions → "Kamu İhale Bülteni (elle)" → Run workflow).
 
+## 5c. Güncelleme 4 (Proje özetleri — ihale dokümanları)
+Supabase → SQL Editor → `supabase/guncelleme-4.sql` → **Run**. `proje_ozet` tablosunu ve yalnızca senin görebildiğin
+`ihale-dokuman` depolama alanını oluşturur. Kullanım: Takip Listem → kartta **📄 Proje özeti** → EKAP'tan indirdiğin doküman
+ZIP'ini (veya PDF/Word/Excel dosyalarını) sürükle. Dosyalar tarayıcıda okunur, özet çıkarılır; dosyalar ve özet hesabına kaydedilir.
+İsteğe bağlı yapay zekâ özeti için sayfadaki kutuya kendi Claude API anahtarını gir (console.anthropic.com → API Keys);
+anahtar yalnızca o tarayıcıda saklanır.
+
 ## 6. Yedek zamanlayıcı (önerilir)
 GitHub'ın kendi zamanlayıcısı yeni repolarda gecikebilir. Supabase her 10 dakikada bir taramayı "kontrol" modunda tetikler:
 1. GitHub → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**

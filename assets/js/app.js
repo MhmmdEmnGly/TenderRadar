@@ -8,6 +8,19 @@
   const news = DATA.news || [];
   const deals = DATA.deals || [];
   const sources = DATA.sources || [];
+  // Dokümanı yüklenmiş / özeti çıkarılmış ihaleler (bulutta proje_ozet tablosu, yerelde tarayıcı deposu)
+  const projeler = DATA.projeler || (() => {
+    const o = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k.startsWith("tr.proje.")) continue;
+        const r = JSON.parse(localStorage.getItem(k)) || {};
+        o[k.slice(9)] = { updatedAt: r.updated_at, files: (r.files || []).length, ai: !!r.ai };
+      }
+    } catch { /* depolama kapalı */ }
+    return o;
+  })();
 
   // ---------- Kalıcı durum ----------
   // Bulut modunda müşteri kartları ve takip listesi Supabase'e yazılır (tüm cihazlarda aynı);
@@ -438,9 +451,10 @@
   }
 
   // ---------- Bileşenler ----------
-  function tenderCard(t) {
+  function tenderCard(t, opts = {}) {
     const w = state.watch[t.id];
     const status = w ? STATUSES.find((s) => s.id === w.status) : null;
+    const pj = opts.proje ? projeler[t.id] : null;
     return `
       <article class="t-card" data-open="${esc(t.id)}" style="--c: var(--${t.bucket === "past" || t.bucket === "cancel" ? "past" : t.bucket})">
         <div class="top">
@@ -461,6 +475,10 @@
           <a class="src-link" href="${esc(t.url)}" target="_blank" rel="noopener" title="${t.ekapUrl ? "EKAP'ta aç" : "İlanı aç"}">↗ ${t.ekapUrl ? "EKAP" : "İlan"}</a>
           <span class="countdown">${esc(t.isCancelled ? "İptal" : countdown(t.tenderDate))}</span>
         </div>
+        ${opts.proje ? `<div class="proje-row">
+          <a class="btn small ${pj ? "" : "primary"}" href="#/proje/${encodeURIComponent(t.id)}">📄 ${pj ? "Proje özeti" : "Dokümanları yükle → özet"}</a>
+          ${pj ? `<span class="muted small">${pj.files} doküman${pj.ai ? " · 🤖 YZ özeti" : ""}</span>` : ""}
+        </div>` : ""}
       </article>`;
   }
 
@@ -651,17 +669,35 @@
         .map((t) => ({ ...t, bucket: bucketOf(t.tenderDate), rel: relevance(t) }))
         .sort((a, b) => new Date(a.tenderDate) - new Date(b.tenderDate));
       return `
-        <div class="page-head"><div><h1>Takip Listem</h1><p>İhaleleri teklif sürecine göre yönet. Durumu kart detayından değiştirebilirsin.</p></div>
+        <div class="page-head"><div><h1>Takip Listem</h1><p>İhaleleri teklif sürecine göre yönet. Durumu kart detayından değiştirebilirsin.
+          <b>📄 Proje özeti</b> ile ihalenin dokümanlarını (idari/teknik şartname, birim fiyat cetveli, sözleşme) yükleyip özetini çıkarabilirsin.</p></div>
           ${watched.length ? `<button class="btn" data-action="export-ics-all" type="button">📅 Tümünü takvime aktar (.ics)</button>` : ""}</div>
         ${watched.length ? `<div class="pipeline">
           ${STATUSES.map((s) => {
             const items = watched.filter((t) => state.watch[t.id].status === s.id);
             return `<section class="lane" style="--c:var(--accent);--c-soft:var(--accent-soft)">
               <div class="lane-head"><h2>${s.label}</h2><span class="n">${items.length}</span></div>
-              ${items.map(tenderCard).join("") || `<div class="empty">—</div>`}
+              ${items.map((t) => tenderCard(t, { proje: true })).join("") || `<div class="empty">—</div>`}
             </section>`;
           }).join("")}
         </div>` : `<div class="card card-pad"><p>Henüz takip ettiğin ihale yok. İhale kartlarındaki <b>☆</b> ile ekleyebilirsin.</p></div>`}`;
+    },
+
+    proje() {
+      const t = tenders.find((x) => x.id === state.param);
+      if (!t) return `<div class="page-head"><div><a class="small" href="#/takip">← Takip listem</a><h1 style="margin-top:6px">Proje özeti</h1></div></div>
+        <div class="card card-pad"><p>Bu ihale artık listede değil (tarihi 3 günden fazla geçmiş ya da kaldırılmış olabilir).</p></div>`;
+      const w = state.watch[t.id];
+      return `
+        <div class="page-head"><div><a class="small" href="#/takip">← Takip listem</a>
+          <h1 style="margin-top:6px">${esc(t.title)}</h1>
+          <p>${esc(t.authority)} · 📅 ${esc(whenText(t))} (${esc(t.isCancelled ? "iptal" : countdown(t.tenderDate))}) · 📍 ${esc(t.city || "—")}${t.ikn ? ` · İKN ${esc(t.ikn)}` : ""}</p></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${w ? "" : `<button class="btn primary" data-star="${esc(t.id)}" type="button">☆ Takibe al</button>`}
+            ${t.ekapUrl ? `<a class="btn" href="${esc(t.ekapUrl)}" target="_blank" rel="noopener">↗ EKAP</a>` : ""}
+            ${t.ilanUrl ? `<a class="btn" href="${esc(t.ilanUrl)}" target="_blank" rel="noopener">↗ İlan</a>` : ""}
+            <button class="btn ghost" data-open="${esc(t.id)}" type="button">Detay</button></div></div>
+        <div id="projeRoot"><p class="muted">Yükleniyor…</p></div>`;
     },
 
     rakipler() {
@@ -1685,6 +1721,7 @@
             : `<button class="btn ghost" data-dismiss="${esc(t.id)}" type="button">✕ Listeden çıkar</button>`}
           <button class="btn" data-action="ics" data-id="${esc(t.id)}" type="button">📅 Takvime ekle</button>
           <button class="btn" data-action="copy" data-id="${esc(t.id)}" type="button">⧉ Özeti kopyala</button>
+          <a class="btn" href="#/proje/${encodeURIComponent(t.id)}" data-action="close-drawer">📄 Proje özeti${projeler[t.id] ? " ✓" : " (dokümanlar)"}</a>
         </div>
         ${w ? `
           <h3 style="margin:24px 0 8px;font-size:14px">Teklif süreci</h3>
@@ -1844,7 +1881,7 @@
   };
   let newIds = new Set(store.get("newIds", []));
   function isBusy() {
-    return $("#drawer").classList.contains("open") || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
+    return $("#drawer").classList.contains("open") || state.view === "proje" || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
   }
   function pollVersion() {
     if (CLOUD) {
@@ -1889,6 +1926,27 @@
     if (justNow) toast(`${justNow} yeni ihale geldi`);
   }
 
+  // ---------- Proje özeti (assets/js/proje.js ilk kullanımda yüklenir) ----------
+  let projeScript = null;
+  function mountProje() {
+    const root = $("#projeRoot");
+    const t = tenders.find((x) => x.id === state.param);
+    if (!root || !t) return;
+    projeScript = projeScript || new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = "assets/js/proje.js?v=" + encodeURIComponent((window.TR_CONFIG && window.TR_CONFIG.version) || "1");
+      s.onload = res; s.onerror = () => { projeScript = null; rej(new Error("proje.js yüklenemedi")); };
+      document.head.appendChild(s);
+    });
+    projeScript.then(() => {
+      if (!document.body.contains(root)) return;   // bu arada başka sayfaya geçildi
+      window.TR_PROJE.mount(root, {
+        tender: t, cloud: CLOUD, keywords: state.keywords.pos, toast,
+        onSaved: (id, row) => { projeler[id] = { updatedAt: row.updated_at, files: (row.files || []).length, ai: !!row.ai }; }
+      });
+    }).catch((e) => { root.innerHTML = `<div class="card card-pad"><p>${esc(e.message)} — sayfayı yenile.</p></div>`; });
+  }
+
   // ---------- Router & render ----------
   function render() {
     const v = views[state.view] ? state.view : "ozet";
@@ -1897,7 +1955,8 @@
     if (v === "ayarlar") loadMailLog();
     if (v === "kurumlar") loadBultenInst();
     if (v === "kurum") loadKurumDetail();
-    const navV = v === "musteri" ? "musteriler" : v === "rakip" ? "rakipler" : v === "kurum" ? "kurumlar" : v;
+    if (v === "proje") mountProje();
+    const navV = v === "musteri" ? "musteriler" : v === "rakip" ? "rakipler" : v === "kurum" ? "kurumlar" : v === "proje" ? "takip" : v;
     document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navV));
   }
   function updateNavCounts() {
@@ -2219,7 +2278,7 @@
   // Geri sayımlar dakikada bir tazelenir (çekmece açıkken ve yazı yazarken dokunma)
   setInterval(() => {
     // Geri sayım gerektirmeyen / uzaktan veri çeken sayfalar dakikalık yenilemeye girmez
-    if (["kurum", "kurumlar", "harita", "sonuc"].includes(state.view) || document.querySelector(".modal-backdrop")) return;
+    if (["kurum", "kurumlar", "harita", "sonuc", "proje"].includes(state.view) || document.querySelector(".modal-backdrop")) return;
     if (!$("#drawer").classList.contains("open") && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) render();
   }, 60000);
 })();

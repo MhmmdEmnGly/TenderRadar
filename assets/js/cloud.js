@@ -110,6 +110,12 @@
     } catch { /* tablo yoksa bülten verisi olmadan devam */ }
     window.TR_DATA.bulten = bulten;
 
+    // ---- Proje özetleri (guncelleme-4.sql kuruluysa): hangi ihalelerin dokümanı/özeti var
+    try {
+      const po = await sb.from("proje_ozet").select("tender_id,updated_at,files,ai_at:ai->>at").limit(1000);
+      window.TR_DATA.projeler = po.error ? null : Object.fromEntries((po.data || []).map((r) => [r.tender_id, { updatedAt: r.updated_at, files: (r.files || []).length, ai: !!r.ai_at }]));
+    } catch { window.TR_DATA.projeler = null; }
+
     // ---- Kullanıcı durumunu (crm, watch) Supabase'e senkronla: değişiklikten 700 ms sonra tek istek
     const pending = {};
     let timer = null;
@@ -162,6 +168,8 @@
       },
       // Salt okunur sorgular (bülten görünümleri vb.): RLS yalnızca giriş yapmış kullanıcıya izin verir
       from(table) { return sb.from(table); },
+      // Kullanıcının özel doküman depolama alanı (proje özetleri)
+      storage(bucket) { return sb.storage.from(bucket); },
       async latestVersion() {
         const { data, error } = await sb.from("datasets").select("data,generated_at").eq("key", "version").maybeSingle();
         if (error || !data) return null;

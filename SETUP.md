@@ -51,7 +51,7 @@ hızlı doldurmak için Actions → "Kamu İhale Bülteni (elle)" → Run workfl
 Supabase → SQL Editor → `supabase/guncelleme-4.sql` → **Run**. `proje_ozet` tablosunu ve yalnızca senin görebildiğin
 `ihale-dokuman` depolama alanını oluşturur. Kullanım: Takip Listem → kartta **📄 Proje özeti** → EKAP'tan indirdiğin doküman
 ZIP'ini (veya PDF/Word/Excel dosyalarını) sürükle. Dosyalar tarayıcıda okunur, özet çıkarılır; dosyalar ve özet hesabına kaydedilir.
-İsteğe bağlı yapay zekâ özeti için sayfadaki kutuya kendi Claude API anahtarını gir (console.anthropic.com → API Keys);
+İsteğe bağlı yapay zekâ özeti: sayfada **Gemini** (ücretsiz kota; anahtar: aistudio.google.com → Get API key) ya da **Claude** (ücretli; console.anthropic.com → API Keys) seç ve anahtarını gir;
 anahtar yalnızca o tarayıcıda saklanır.
 
 ## 6. Yedek zamanlayıcı (önerilir)

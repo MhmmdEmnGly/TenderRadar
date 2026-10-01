@@ -414,3 +414,6 @@ body.gated .app { visibility: hidden; }
 @media (max-width: 800px) { .heads { columns: 1; } .proje-grid { grid-template-columns: 1fr; } }
 @media print { #projeRoot .proje-docs, #projeRoot .btn, #aiCard form { display: none !important; } details { display: block; } details > * { display: block; } }
 .proje-docs-head h3 .muted, #aiCard h3 .muted { margin-left: 6px; font-weight: 400; }
+.prov-switch { display: flex; gap: 6px; flex-wrap: wrap; }
+.ai-run { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.ai-run select { font-size: 12px; padding: 3px 6px; margin-left: 4px; }

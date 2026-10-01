@@ -19,8 +19,21 @@
   const BUCKET = "ihale-dokuman";
   const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
   const MAX_UPLOAD = 50 * 1024 * 1024;
-  const AI_MODEL = "claude-opus-5-5";
-  const KEY_STORE = "tr.anthropicKey";
+  // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
+  const PROVIDERS = {
+    gemini: { label: "Gemini", note: "ücretsiz kota", keyStore: "tr.geminiKey", keyOk: (k) => /^[\w-]{30,}$/.test(k), keyHint: "AIza…",
+      keyUrl: "https://aistudio.google.com/apikey", keySite: "aistudio.google.com" },
+    claude: { label: "Claude", note: "ücretli", keyStore: "tr.anthropicKey", keyOk: (k) => /^sk-ant-/.test(k), keyHint: "sk-ant-…",
+      keyUrl: "https://console.anthropic.com/settings/keys", keySite: "console.anthropic.com" }
+  };
+  const PROV_STORE = "tr.aiProvider";
+  const CLAUDE_MODEL = "claude-opus-5-5";
+  const GEMINI_MODELS = [["gemini-3.8-flash", "Gemini 3.8 Flash (önerilen)"], ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (daha yüksek kota)"], ["gemini-flash-latest", "En güncel Flash"]];
+  const GEMINI_FALLBACK = "gemini-3.5-flash-lite";
+  const GMODEL_STORE = "tr.geminiModel";
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* depolama kapalı */ } };
+  const provider = () => (PROVIDERS[lsGet(PROV_STORE)] ? lsGet(PROV_STORE) : "gemini");
 
   // ---------- Kütüphane yükleme ----------
   const loaded = {};
@@ -613,7 +626,7 @@
     ctx.onSaved && ctx.onSaved(t.id, row);
   }
 
-  // ---------- Yapay zekâ özeti (kullanıcının kendi Claude API anahtarıyla) ----------
+  // ---------- Yapay zekâ özeti (kullanıcının kendi Gemini veya Claude API anahtarıyla) ----------
   const S = (d) => ({ type: "string", description: d });
   const A = (d) => ({ type: "array", items: { type: "string" }, description: d });
   const AI_SCHEMA = {
@@ -647,34 +660,124 @@ Görevin, teklif verip vermemeye karar verecek ve teklifi hazırlayacak ekip iç
 Yalnızca dokümanlarda yazanlara dayan; bilgi yoksa "Belirtilmemiş" yaz, tahmin etme. Önemli bilginin hangi dokümandan geldiğini gerektiğinde parantez içinde kısaca belirt (ör. "(Teknik Ş. md. 4.2)").
 Kısa ve net yaz; maddeler tek cümle olsun.`;
 
-  async function runAi(ctx, rec, mem, onProgress) {
-    const key = localStorage.getItem(KEY_STORE);
-    if (!key) throw new Error("Claude API anahtarı girilmemiş");
-    const { default: Anthropic } = await import(LIB.sdk);
-    const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
-    const t = ctx.tender;
-    const content = [];
+  // Gönderilecek dokümanlar: metni okunan belgeler metin olarak, taranmış PDF'ler dosya olarak (model görsel okur).
+  // Yalnızca ihale dokümanları gönderilir; notlar, müşteri kartları vb. asla gönderilmez.
+  async function collectDocs(ctx, rec, mem, maxPdfBytes) {
+    const out = [];
     const files = [...rec.files].sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
     let pdfBytes = 0;
     for (const f of files) {
       if (f.type === "form") continue;
+      const label = `${TYPES[f.type]} — ${f.name}`;
       const txt = rec.texts[f.id];
-      if (f.scanned && f.ext === "pdf" && f.size < 20e6 && pdfBytes + f.size < 25e6) {
+      if (f.scanned && f.ext === "pdf" && pdfBytes + f.size < maxPdfBytes) {
         const blob = mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null);
-        if (blob) {
-          const b64 = await blobToBase64(blob);
-          pdfBytes += f.size;
-          content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 }, title: `${TYPES[f.type]} — ${f.name}` });
-          continue;
-        }
+        if (blob) { pdfBytes += f.size; out.push({ kind: "pdf", label, b64: await blobToBase64(blob) }); continue; }
       }
-      if (txt) content.push({ type: "text", text: `### ${TYPES[f.type]} — ${f.name}\n\n${txt}` });
+      if (txt) out.push({ kind: "text", label, text: txt });
     }
-    if (!content.length) throw new Error("Yapay zekâya gönderilecek okunabilir doküman yok");
-    content.push({ type: "text", text: `İhale: ${t.title}\nİdare: ${t.authority}${t.ikn ? "\nİKN: " + t.ikn : ""}${t.tenderDate ? "\nPanelde kayıtlı ihale tarihi: " + new Date(t.tenderDate).toLocaleString("tr-TR") : ""}\n\nYukarıdaki dokümanların tamamını inceleyip proje özetini istenen yapıda hazırla.` });
+    if (!out.length) throw new Error("Yapay zekâya gönderilecek okunabilir doküman yok");
+    const chars = out.reduce((a, d) => a + (d.text || "").length, 0);
+    if (chars / 3 > 900000) throw new Error("Dokümanlar modelin okuyabileceğinden uzun; gereksiz dosyaları (ekler, formlar) listeden çıkarıp tekrar dene");
+    return out;
+  }
+  function aiInstruction(t) {
+    return `İhale: ${t.title}\nİdare: ${t.authority}${t.ikn ? "\nİKN: " + t.ikn : ""}${t.tenderDate ? "\nPanelde kayıtlı ihale tarihi: " + new Date(t.tenderDate).toLocaleString("tr-TR") : ""}\n\nYukarıdaki dokümanların tamamını inceleyip proje özetini istenen yapıda hazırla.`;
+  }
+  // Model şemadaki bazı alanları atlarsa ekranda boş liste göster
+  function normalizeAi(o) {
+    const arr = (v) => (Array.isArray(v) ? v.filter((x) => x != null && x !== "") : []);
+    return {
+      genel_ozet: String(o.genel_ozet || ""), kunye: o.kunye && typeof o.kunye === "object" ? o.kunye : {},
+      kapsam: arr(o.kapsam), ana_kalemler: arr(o.ana_kalemler).filter((x) => typeof x === "object"), teknik_gereksinimler: arr(o.teknik_gereksinimler),
+      yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz)
+    };
+  }
+  function parseJsonLoose(txt) {
+    const s = String(txt || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+    try { return JSON.parse(s); } catch { /* aşağıda */ }
+    const i = s.indexOf("{"), j = s.lastIndexOf("}");
+    if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)); } catch { /* okunamadı */ } }
+    throw new Error("Yapay zekâ yanıtı okunamadı; tekrar dene");
+  }
+
+  function runAi(ctx, rec, mem, onProgress) {
+    return provider() === "claude" ? runClaude(ctx, rec, mem, onProgress) : runGemini(ctx, rec, mem, onProgress);
+  }
+
+  // --- Google Gemini (ücretsiz katman) — REST generateContent, JSON çıktı şemasıyla
+  function toGeminiSchema(s) {
+    const o = { type: String(s.type).toUpperCase() };
+    if (s.description) o.description = s.description;
+    if (s.properties) {
+      o.properties = Object.fromEntries(Object.entries(s.properties).map(([k, v]) => [k, toGeminiSchema(v)]));
+      o.propertyOrdering = Object.keys(s.properties);
+    }
+    if (s.required) o.required = s.required;
+    if (s.items) o.items = toGeminiSchema(s.items);
+    return o;
+  }
+  async function runGemini(ctx, rec, mem, onProgress) {
+    const key = lsGet(PROVIDERS.gemini.keyStore);
+    if (!key) throw new Error("Gemini API anahtarı girilmemiş");
+    const model = lsGet(GMODEL_STORE) || GEMINI_MODELS[0][0];
+    const docs = await collectDocs(ctx, rec, mem, 12e6);   // istek sınırı ~20 MB; base64 %33 büyütür
+    const parts = [];
+    for (const d of docs) {
+      if (d.kind === "pdf") parts.push({ text: `### ${d.label} (taranmış PDF)` }, { inline_data: { mime_type: "application/pdf", data: d.b64 } });
+      else parts.push({ text: `### ${d.label}\n\n${d.text}` });
+    }
+    parts.push({ text: aiInstruction(ctx.tender) });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: AI_SYSTEM }] },
+      contents: [{ role: "user", parts }],
+      generationConfig: { responseMimeType: "application/json", responseSchema: toGeminiSchema(AI_SCHEMA), maxOutputTokens: 16384 }
+    });
+    async function call(m) {
+      onProgress && onProgress(`Gemini (${m}) dokümanları okuyor… genellikle 20–90 saniye sürer`);
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent`, {
+        method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": key }, body
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const e = new Error(`Gemini ${r.status} ${(j.error && (j.error.status || "")) || ""}: ${(j.error && j.error.message) || r.statusText}`);
+        e.status = r.status; e.provider = "gemini";
+        throw e;
+      }
+      return j;
+    }
+    let used = model, j;
+    try { j = await call(model); }
+    catch (e) {
+      // Kota dolduysa ya da model adı değiştiyse daha yüksek kotalı Flash-Lite ile bir kez daha dene
+      if ((e.status === 429 || e.status === 404) && model !== GEMINI_FALLBACK) { used = GEMINI_FALLBACK; j = await call(GEMINI_FALLBACK); }
+      else throw e;
+    }
+    const cand = j.candidates && j.candidates[0];
+    if (!cand) throw new Error("Gemini yanıt vermedi" + (j.promptFeedback && j.promptFeedback.blockReason ? ` (engellendi: ${j.promptFeedback.blockReason})` : ""));
+    if (cand.finishReason === "MAX_TOKENS") throw new Error("Yanıt uzunluk sınırına takıldı; tekrar dene");
+    if (cand.finishReason && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(cand.finishReason) && !(cand.content && cand.content.parts)) throw new Error(`Gemini yanıtı tamamlamadı (${cand.finishReason})`);
+    const txt = ((cand.content && cand.content.parts) || []).filter((p) => p.text && !p.thought).map((p) => p.text).join("");
+    const u = j.usageMetadata || {};
+    return { ...normalizeAi(parseJsonLoose(txt)), provider: "gemini", model: j.modelVersion || used, at: new Date().toISOString(),
+      usage: { input: u.promptTokenCount, output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0), free: true } };
+  }
+
+  // --- Anthropic Claude (ücretli) — resmi SDK, akış + JSON şeması
+  async function runClaude(ctx, rec, mem, onProgress) {
+    const key = lsGet(PROVIDERS.claude.keyStore);
+    if (!key) throw new Error("Claude API anahtarı girilmemiş");
+    const { default: Anthropic } = await import(LIB.sdk);
+    const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
+    const docs = await collectDocs(ctx, rec, mem, 25e6);
+    const content = docs.map((d) => d.kind === "pdf"
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: d.b64 }, title: d.label }
+      : { type: "text", text: `### ${d.label}\n\n${d.text}` });
+    content.push({ type: "text", text: aiInstruction(ctx.tender) });
+    onProgress && onProgress("Claude dokümanları okuyor…");
 
     const stream = client.beta.messages.stream({
-      model: AI_MODEL,
+      model: CLAUDE_MODEL,
       max_tokens: 32000,
       betas: ["server-side-fallback-2026-07-01"],
       fallbacks: "default",
@@ -689,11 +792,28 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     if (msg.stop_reason === "refusal") throw new Error("Model bu isteği yanıtlamadı (refusal)");
     if (msg.stop_reason === "max_tokens") throw new Error("Yanıt uzunluk sınırına takıldı; tekrar dene");
     const txt = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-    let out;
-    try { out = JSON.parse(txt); } catch { throw new Error("Yapay zekâ yanıtı okunamadı"); }
     const u = msg.usage || {};
     const cost = ((u.input_tokens || 0) * 4 + (u.output_tokens || 0) * 20) / 1e6;
-    return { ...out, model: msg.model, at: new Date().toISOString(), usage: { input: u.input_tokens, output: u.output_tokens, costUsd: Math.round(cost * 100) / 100 } };
+    return { ...normalizeAi(parseJsonLoose(txt)), provider: "claude", model: msg.model, at: new Date().toISOString(),
+      usage: { input: u.input_tokens, output: u.output_tokens, costUsd: Math.round(cost * 100) / 100 } };
+  }
+  function aiErrorText(pv, err) {
+    const m = String((err && err.message) || err);
+    const s = err && err.status;
+    if (pv === "gemini") {
+      if (/API_KEY_INVALID|API key not valid|API key expired/i.test(m) || s === 401) return "Gemini anahtarı geçersiz. Anahtarı silip aistudio.google.com'dan aldığın anahtarı yeniden gir.";
+      if (s === 429 || /RESOURCE_EXHAUSTED|quota/i.test(m)) return "Gemini ücretsiz kotası doldu (dakikalık ya da günlük sınır). Bir dakika sonra tekrar dene; günlük sınır dolduysa yarın sıfırlanır. Doküman çok büyükse gereksiz dosyaları listeden çıkarmak da yardımcı olur.";
+      if (/location is not supported|not available in your country/i.test(m)) return "Gemini API bulunduğun bölgede ücretsiz olarak sunulmuyor.";
+      if (s === 403) return "Bu anahtarın Gemini API'ye erişim izni yok (Google AI Studio'da anahtarın projesini kontrol et).";
+      if (s === 404) return "Seçili Gemini modeli bulunamadı; listeden başka bir model seçip tekrar dene.";
+      if (s >= 500) return "Google tarafında geçici bir sorun var; biraz sonra tekrar dene.";
+      if (/Failed to fetch|NetworkError/i.test(m)) return "Google'a bağlanılamadı; internet bağlantını kontrol et.";
+      return "Gemini özeti oluşturulamadı: " + m;
+    }
+    if (s === 401 || /authentication|invalid x-api-key/i.test(m)) return "Claude anahtarı geçersiz. Anahtarı silip yeniden gir.";
+    if (s === 429 || /rate/i.test(m)) return "Hız sınırına takıldı; bir dakika sonra tekrar dene.";
+    if (/credit|billing|balance/i.test(m)) return "Anthropic hesabında kredi yok; console.anthropic.com → Billing.";
+    return "Claude özeti oluşturulamadı: " + m;
   }
   function blobToBase64(blob) {
     return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = rej; r.readAsDataURL(blob); });
@@ -823,20 +943,33 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
 
     function aiHtml() {
       const ai = st.rec.ai;
-      const hasKey = !!localStorage.getItem(KEY_STORE);
+      const pv = provider(), P = PROVIDERS[pv];
+      const hasKey = !!lsGet(P.keyStore);
       const chars = st.rec.files.filter((f) => f.type !== "form").reduce((a, f) => a + (st.rec.texts[f.id] || "").length, 0);
       const estIn = Math.round(chars / 3);
       const estCost = (estIn * 4 + 6000 * 20) / 1e6;
+      const gModel = lsGet(GMODEL_STORE) || GEMINI_MODELS[0][0];
       const L = (title, arr) => arr && arr.length ? `<section><h4>${title}</h4><ul class="small">${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : "";
+      const info = pv === "gemini"
+        ? `Tüm dokümanlar birlikte okunur (≈ ${estIn.toLocaleString("tr-TR")} token) — Google'ın <b>ücretsiz kotasıyla</b> çalışır. Taranmış PDF'ler görsel olarak okunur.
+           <br><span class="muted">Ücretsiz katmanda Google gönderilen içeriği ürünlerini geliştirmek için kullanabilir; bu yüzden yalnızca ihale dokümanları gönderilir — notların, fiyatların ve müşteri kartların gönderilmez.</span>`
+        : `Tüm dokümanlar birlikte okunur (≈ ${estIn.toLocaleString("tr-TR")} token, tahmini maliyet ≈ $${estCost.toFixed(2)}). Taranmış PDF'ler görsel olarak okunur.`;
       return `
         <div class="card card-pad" id="aiCard">
-          <div class="proje-docs-head"><h3 style="margin:0">Yapay zekâ ile detaylı özet <span class="muted small">Claude</span></h3>
-            ${hasKey ? `<button class="btn small ${ai ? "" : "primary"}" data-p="ai" type="button" ${st.busy ? "disabled" : ""}>${ai ? "↻ Yeniden oluştur" : "🤖 Özet oluştur"}</button>` : ""}</div>
-          ${hasKey ? `<p class="muted small" style="margin:6px 0 0">Tüm dokümanlar birlikte okunur (≈ ${estIn.toLocaleString("tr-TR")} token, tahmini maliyet ≈ $${estCost.toFixed(2)}). Taranmış PDF'ler görsel olarak okunur.
-              <a href="#" data-p="key-clear">Anahtarı bu cihazdan sil</a></p>`
-            : `<p class="small" style="margin:6px 0 8px">Kural tabanlı özete ek olarak dokümanları gerçekten okuyup yorumlayan bir özet (kapsam, riskler, açıklama talebi soruları) için kendi <b>Claude API anahtarını</b> gir.
-                Anahtar yalnızca bu tarayıcıda saklanır, sunucuya/veritabanına yazılmaz. Anahtarı <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> → API Keys'ten alabilirsin (kullandıkça ücretlendirilir).</p>
-               <form class="kw-add" data-pform="key"><input class="input" name="key" type="password" autocomplete="off" placeholder="sk-ant-…" style="flex:1"><button class="btn primary" type="submit">Kaydet</button></form>`}
+          <div class="proje-docs-head"><h3 style="margin:0">Yapay zekâ ile detaylı özet</h3>
+            <div class="prov-switch" role="group" aria-label="Yapay zekâ sağlayıcısı">
+              ${Object.entries(PROVIDERS).map(([k, p]) => `<button class="btn small ${k === pv ? "on" : "ghost"}" data-p="prov" data-v="${k}" type="button" ${st.busy ? "disabled" : ""}>${p.label} <span class="muted">(${p.note})</span>${lsGet(p.keyStore) ? " ✓" : ""}</button>`).join("")}
+            </div></div>
+          ${hasKey ? `
+            <div class="ai-run">
+              ${pv === "gemini" ? `<label class="small">Model <select data-pmodel>${GEMINI_MODELS.map(([v, l]) => `<option value="${v}" ${v === gModel ? "selected" : ""}>${l}</option>`).join("")}</select></label>` : `<span class="small">Model: ${CLAUDE_MODEL}</span>`}
+              <button class="btn small ${ai ? "" : "primary"}" data-p="ai" type="button" ${st.busy ? "disabled" : ""}>${ai ? `↻ ${P.label} ile yeniden oluştur` : `🤖 ${P.label} ile özet oluştur`}</button>
+            </div>
+            <p class="muted small ai-status" style="margin:6px 0 0">${info} <a href="#" data-p="key-clear">${P.label} anahtarını bu cihazdan sil</a></p>`
+          : `<p class="small" style="margin:8px 0 8px">Kural tabanlı özete ek olarak dokümanları okuyup yorumlayan bir özet (kapsam, riskler, açıklama talebi soruları) için <b>${P.label} API anahtarını</b> gir.
+               Anahtarı <a href="${P.keyUrl}" target="_blank" rel="noopener">${P.keySite}</a> adresinden alabilirsin${pv === "gemini" ? " (Google hesabıyla, kredi kartı gerekmez)" : " (kullandıkça ücretlendirilir)"}.
+               Anahtar yalnızca bu tarayıcıda saklanır, sunucuya/veritabanına yazılmaz — her cihazda bir kez girmen gerekir.</p>
+             <form class="kw-add" data-pform="key"><input type="hidden" name="prov" value="${pv}"><input class="input" name="key" type="password" autocomplete="off" placeholder="${P.keyHint}" style="flex:1"><button class="btn primary" type="submit">Kaydet</button></form>`}
           ${st.aiErr ? `<p class="small" style="color:var(--urgent);margin:8px 0 0">${esc(st.aiErr)}</p>` : ""}
           ${ai ? `
             <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${esc(ai.genel_ozet)}</div>
@@ -854,7 +987,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
               ${L("Açıklama talebi için sorular", ai.sorulacak_sorular)}
               ${L("Eksik veya belirsiz", ai.eksik_veya_belirsiz)}
             </div>
-            <p class="muted small" style="margin:10px 0 0">${esc(ai.model || "")} · ${new Date(ai.at).toLocaleString("tr-TR")}${ai.usage ? ` · ${(ai.usage.input || 0).toLocaleString("tr-TR")} + ${(ai.usage.output || 0).toLocaleString("tr-TR")} token ≈ $${ai.usage.costUsd}` : ""}. Yapay zekâ hata yapabilir; kritik bilgileri dokümandan teyit et.</p>` : ""}
+            <p class="muted small" style="margin:10px 0 0">${esc(PROVIDERS[ai.provider || "claude"]?.label || "")} · ${esc(ai.model || "")} · ${new Date(ai.at).toLocaleString("tr-TR")}${ai.usage ? ` · ${(ai.usage.input || 0).toLocaleString("tr-TR")} + ${(ai.usage.output || 0).toLocaleString("tr-TR")} token${ai.usage.free ? " (ücretsiz kota)" : ai.usage.costUsd != null ? ` ≈ $${ai.usage.costUsd}` : ""}` : ""}. Yapay zekâ hata yapabilir; kritik bilgileri dokümandan teyit et.</p>` : ""}
         </div>`;
     }
 
@@ -948,35 +1081,38 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
       } else if (a === "print") {
         window.print();
       } else if (a === "key-clear") {
-        e.preventDefault(); localStorage.removeItem(KEY_STORE); draw();
+        e.preventDefault(); lsSet(PROVIDERS[provider()].keyStore, null); st.aiErr = null; draw();
+      } else if (a === "prov") {
+        lsSet(PROV_STORE, el.dataset.v); st.aiErr = null; draw();
       } else if (a === "ai") {
+        const pv = provider();
         st.aiErr = null; st.busy = "Yapay zekâ özeti hazırlanıyor…"; draw();
-        const status = () => root.querySelector("#aiCard .muted.small");
+        const status = () => root.querySelector("#aiCard .ai-status");
         try {
           st.rec.ai = await runAi(ctx, st.rec, st.mem, (m) => { const s = status(); if (s) s.textContent = m; });
           await saveRecord(ctx, st.rec);
           ctx.toast && ctx.toast("Yapay zekâ özeti hazır");
         } catch (err) {
-          const m = String(err && err.message || err);
-          st.aiErr = /401|authentication|invalid x-api-key/i.test(m) ? "API anahtarı geçersiz. Anahtarı silip yeniden gir."
-            : /429|rate/i.test(m) ? "Hız sınırına takıldı; bir dakika sonra tekrar dene."
-            : /credit|billing|balance/i.test(m) ? "Anthropic hesabında kredi yok; console.anthropic.com → Billing."
-            : "Yapay zekâ özeti oluşturulamadı: " + m;
+          st.aiErr = aiErrorText(pv, err);
         }
         st.busy = ""; draw();
       }
     });
     root.addEventListener("change", (e) => {
       if (e.target.id === "pFile") { addFiles(e.target.files); return; }
+      if (e.target.dataset.pmodel !== undefined) { lsSet(GMODEL_STORE, e.target.value); return; }
       const id = e.target.dataset.ptype;
       if (id) { const f = st.rec.files.find((x) => x.id === id); if (f) { f.type = e.target.value; recompute(); persist("Doküman türü güncellendi"); } }
     });
     root.addEventListener("submit", (e) => {
       if (e.target.dataset.pform !== "key") return;
       e.preventDefault();
-      const v = String(new FormData(e.target).get("key") || "").trim();
-      if (!/^sk-ant-/.test(v)) { st.aiErr = "Anahtar \"sk-ant-\" ile başlamalı."; draw(); return; }
-      localStorage.setItem(KEY_STORE, v); st.aiErr = null; draw();
+      const fd = new FormData(e.target);
+      const P = PROVIDERS[fd.get("prov")] || PROVIDERS[provider()];
+      const v = String(fd.get("key") || "").replace(/\s+/g, "");
+      if (!P.keyOk(v)) { st.aiErr = `Bu bir ${P.label} API anahtarına benzemiyor (beklenen biçim: ${P.keyHint}).`; draw(); return; }
+      lsSet(P.keyStore, v); st.aiErr = null; draw();
+      ctx.toast && ctx.toast(`${P.label} anahtarı bu tarayıcıya kaydedildi`);
     });
     root.addEventListener("dragover", (e) => { if (e.target.closest("#pDrop")) { e.preventDefault(); e.target.closest("#pDrop").classList.add("over"); } });
     root.addEventListener("dragleave", (e) => { const z = e.target.closest("#pDrop"); if (z) z.classList.remove("over"); });

@@ -18,6 +18,7 @@
   };
   const BUCKET = "ihale-dokuman";
   const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
+  const SUMMARY_V = 2;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
   const MAX_UPLOAD = 50 * 1024 * 1024;
   // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
   const PROVIDERS = {
@@ -157,6 +158,133 @@
     return { text, pages: null, approx: true };
   }
 
+  // EKAP ve idarelerin verdiği ".doc" dosyalarının çoğu aslında Word'ün kaydettiği HTML / MHT / Word-XML / RTF'tir.
+  // Uzantıya değil içeriğe bakarak doğru okuyucuyu seç.
+  function sniffKind(buf) {
+    const head = new TextDecoder("latin1").decode(new Uint8Array(buf, 0, Math.min(4096, buf.byteLength)));
+    if (/^PK\x03\x04/.test(head)) return "zip";
+    if (/^\s*\{\\rtf/.test(head)) return "rtf";
+    if (/^MIME-Version:/im.test(head) && /multipart\/related/i.test(head)) return "mht";
+    if (/<w:wordDocument|<\?mso-application[^>]*Word\.Document/i.test(head)) return "wordxml";
+    if (/<(html|!doctype html|head|body|meta|div|p|table)[\s>]/i.test(head) || /xmlns:o="urn:schemas-microsoft-com/i.test(head)) return "html";
+    if (/^\xD0\xCF\x11\xE0/.test(head)) return "ole";   // gerçek eski Word ikili dosyası
+    return "";
+  }
+  // Bayt dizisini doğru karakter kümesiyle çöz (UTF-8 değilse Türkçe Windows-1254)
+  function decodeBytes(u8, hint) {
+    const cs = String(hint || "").toLowerCase().replace(/^iso-8859-9$/, "windows-1254");
+    if (cs && !/utf-?8/.test(cs)) { try { return new TextDecoder(cs).decode(u8); } catch { /* bilinmeyen kodlama */ } }
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(u8); } catch { return new TextDecoder("windows-1254").decode(u8); }
+  }
+  // DOM'u satır/hücre yapısını koruyarak düz metne çevir (Word HTML'i, Word 2003 XML'i)
+  const BLOCK = new Set(["p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "section", "article", "ul", "ol", "blockquote", "pre", "dt", "dd"]);
+  function domToText(root) {
+    let out = "";
+    const walk = (n) => {
+      if (n.nodeType === 3) { out += n.nodeValue.replace(/\s+/g, " "); return; }
+      if (n.nodeType !== 1) return;
+      const tag = (n.localName || n.nodeName || "").toLowerCase();
+      if (["style", "script", "head", "title", "xml", "binData", "o:documentproperties"].includes(tag)) return;
+      if (tag === "tab") { out += "\t"; return; }
+      for (const c of n.childNodes) walk(c);
+      if (tag === "td" || tag === "th" || tag === "tc") out += " | ";
+      else if (BLOCK.has(tag)) out += "\n";
+    };
+    walk(root);
+    return out.replace(/[ \t]*\|[ \t]*\n/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  function readHtmlText(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    doc.querySelectorAll("style,script,head,xml,title").forEach((x) => x.remove());
+    return domToText(doc.body || doc.documentElement);
+  }
+  function readHtmlLike(buf, kind) {
+    const u8 = new Uint8Array(buf);
+    if (kind === "mht") {
+      const raw = new TextDecoder("latin1").decode(u8);
+      const bnd = (raw.match(/boundary="?([^"\r\n;]+)"?/i) || [])[1];
+      const partsMht = bnd ? raw.split("--" + bnd) : [raw];
+      const part = partsMht.find((p) => /Content-Type:\s*text\/html/i.test(p)) || partsMht[1] || raw;
+      const cs = (part.match(/charset="?([\w-]+)"?/i) || [])[1];
+      const sep = part.search(/\r?\n\r?\n/);
+      let body = sep >= 0 ? part.slice(sep).trim() : part;
+      let bytes;
+      if (/Content-Transfer-Encoding:\s*quoted-printable/i.test(part)) {
+        body = body.replace(/=\r?\n/g, "");
+        const arr = [];
+        for (let i = 0; i < body.length; i++) {
+          if (body[i] === "=" && /^[0-9A-F]{2}$/i.test(body.substr(i + 1, 2))) { arr.push(parseInt(body.substr(i + 1, 2), 16)); i += 2; }
+          else arr.push(body.charCodeAt(i) & 255);
+        }
+        bytes = new Uint8Array(arr);
+      } else if (/Content-Transfer-Encoding:\s*base64/i.test(part)) {
+        bytes = Uint8Array.from(atob(body.replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+      } else bytes = Uint8Array.from(body, (c) => c.charCodeAt(0) & 255);
+      return { text: readHtmlText(decodeBytes(bytes, cs)), pages: null };
+    }
+    const latin = new TextDecoder("latin1").decode(u8.subarray(0, Math.min(8192, u8.length)));
+    const cs = (latin.match(/charset\s*=\s*["']?([\w-]+)/i) || latin.match(/encoding="([\w-]+)"/i) || [])[1];
+    const str = decodeBytes(u8, cs);
+    if (kind === "wordxml") {
+      const xml = new DOMParser().parseFromString(str, "application/xml");
+      return { text: domToText(xml.documentElement), pages: null };
+    }
+    return { text: readHtmlText(str), pages: null };
+  }
+  // RTF: kontrol kelimelerini at, \'xx (Windows-1254) ve \uN karakterlerini çöz
+  function readRtf(buf) {
+    const s = new TextDecoder("latin1").decode(new Uint8Array(buf));
+    const cp = new TextDecoder("windows-1254");
+    let out = "", depth = 0;
+    const skipAt = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === "{") { depth++; if (/^\{\\\*|^\{\\(fonttbl|colortbl|stylesheet|info|pict|object|themedata|datastore|latentstyles)/.test(s.slice(i, i + 16))) skipAt.push(depth); continue; }
+      if (c === "}") { if (skipAt[skipAt.length - 1] === depth) skipAt.pop(); depth--; continue; }
+      const skipping = skipAt.length > 0;
+      if (c === "\\") {
+        const nx = s[i + 1];
+        if (nx === "'") { if (!skipping) out += cp.decode(new Uint8Array([parseInt(s.substr(i + 2, 2), 16)])); i += 3; continue; }
+        if (nx === "\\" || nx === "{" || nx === "}") { if (!skipping) out += nx; i++; continue; }
+        const m = /^\\([a-z]+)(-?\d+)? ?/i.exec(s.slice(i, i + 40));
+        if (!m) { i++; continue; }
+        i += m[0].length - 1;
+        if (skipping) continue;
+        const w = m[1];
+        if (w === "par" || w === "line" || w === "row" || w === "sect" || w === "page") out += "\n";
+        else if (w === "tab") out += "\t";
+        else if (w === "cell") out += " | ";
+        else if (w === "u" && m[2]) { let code = +m[2]; if (code < 0) code += 65536; out += String.fromCharCode(code); if (s[i + 1] === "?") i++; }
+        continue;
+      }
+      if (!skipping && c !== "\r" && c !== "\n") out += c;
+    }
+    return { text: out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim(), pages: null };
+  }
+
+  // Daha önce yanlış okunmuş metinlerdeki HTML kalıntılarını onar: "ccedil;" → ç, "nbsp;" → boşluk, stil parçalarını sil
+  const ENT = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ccedil: "ç", Ccedil: "Ç", ouml: "ö", Ouml: "Ö", uuml: "ü", Uuml: "Ü",
+    acirc: "â", Acirc: "Â", icirc: "î", Icirc: "Î", ucirc: "û", Ucirc: "Û", ecirc: "ê", eacute: "é", Eacute: "É", aacute: "á", iacute: "í", oacute: "ó", uacute: "ú",
+    agrave: "à", egrave: "è", rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“", sbquo: "‚", bdquo: "„", ndash: "–", mdash: "—", hellip: "…", bull: "•", middot: "·",
+    deg: "°", sup2: "²", sup3: "³", times: "×", divide: "÷", plusmn: "±", ordm: "º", ordf: "ª", laquo: "«", raquo: "»", euro: "€", shy: "", zwnj: "", zwj: "", lrm: "", rlm: "" };
+  const CSS_PROPS = "text-align|text-underline|text-decoration|text-indent|text-autospace|text-justify|mso-[\\w-]+|font-[\\w-]+|margin(?:-[\\w-]+)?|line-height|tab-stops|layout-grid-mode|vertical-align|letter-spacing|word-spacing|punctuation-wrap|page-break-[\\w-]+|border(?:-[\\w-]+)?|padding(?:-[\\w-]+)?|background(?:-[\\w-]+)?|color|width|height";
+  const RX_CSS = new RegExp(`["']?\\s*\\b(?:${CSS_PROPS})\\s*:\\s*[^;"'<>\\n]{0,80};?\\s*["']?`, "gi");
+  function repairText(t) {
+    if (!t) return t;
+    let s = String(t);
+    if (!/(?:^|[^A-Za-z])(?:&?(?:[a-zA-Z]{2,8}|#\d{2,5});)|(?:text-align|mso-|text-underline|font-family)\s*:/.test(s)) return s;
+    // Eski okuyucu metni "&" işaretinde satıra bölmüştü: "i⏎ccedil;me" → "içme", "ve ⏎ccedil;alışır" → "ve çalışır"
+    s = s.replace(/\r?\n&?([a-zA-Z]{2,8});/g, (m, n) => (n in ENT ? ENT[n] : m))
+      .replace(/(\p{L})\r?\n&?#?(199|214|220|231|246|252|286|287|304|305|350|351|160|8211|8212|8216|8217|8220|8221);/gu, (m, c, n) => c + String.fromCharCode(+n));
+    s = s.replace(/&?#(\d{2,5});/g, (m, n) => String.fromCharCode(+n))
+      .replace(/&?\b([a-zA-Z]{2,8});/g, (m, n) => (n in ENT ? ENT[n] : m))
+      .replace(RX_CSS, " ")
+      .replace(/\b(?:style|class|lang|align)\s*=\s*("[^"]*"|'[^']*')/gi, " ")
+      .replace(/(^|\s)["']{1,2}(?=\s|$)/g, "$1")
+      .replace(/[ \t]{2,}/g, " ");
+    return s;
+  }
+
   // ---------- Belge türü ----------
   const TYPES = {
     idari: "İdari şartname", teknik: "Teknik şartname", cetvel: "Birim fiyat / kalem listesi", sozlesme: "Sözleşme tasarısı",
@@ -203,17 +331,20 @@
       onStep && onStep(`Okunuyor: ${name}`);
       try {
         let r;
+        const kind = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "jpg", "jpeg", "png", "webp", "tif", "tiff"].includes(ext) ? "" : sniffKind(buf);
         if (ext === "pdf") r = await readPdf(buf);
-        else if (ext === "docx" || ext === "docm") r = await readDocx(buf);
+        else if (["html", "mht", "wordxml"].includes(kind)) r = readHtmlLike(buf, kind);   // ".doc" görünümlü Word HTML/MHT/XML dosyaları
+        else if (kind === "rtf") r = readRtf(buf);
+        else if (ext === "docx" || ext === "docm" || (kind === "zip" && ext === "doc")) r = await readDocx(buf);
         else if (["xlsx", "xls", "xlsm", "ods", "csv"].includes(ext)) r = await readSheet(buf);
-        else if (ext === "doc") r = readLegacyDoc(buf);
-        else if (ext === "txt") r = { text: new TextDecoder().decode(buf) };
-        else if (["htm", "html"].includes(ext)) r = { text: new DOMParser().parseFromString(new TextDecoder().decode(buf), "text/html").body.innerText || "" };
+        else if (ext === "doc" || kind === "ole") r = readLegacyDoc(buf);
+        else if (["txt", "rtf", "htm", "html", "mht", "mhtml", "xml"].includes(ext)) r = { text: decodeBytes(new Uint8Array(buf)) };
         else if (["rar", "7z"].includes(ext)) throw new Error(`${ext.toUpperCase()} arşivi tarayıcıda açılamıyor — dosyaları çıkarıp ZIP ya da tek tek yükle`);
         else if (["jpg", "jpeg", "png", "webp", "tif", "tiff"].includes(ext)) r = { text: "", scanned: true, image: true };
         else throw new Error("Desteklenmeyen dosya türü");
         Object.assign(doc, r);
       } catch (e) { doc.error = e.message || String(e); }
+      doc.text = repairText(doc.text || "");
       if (doc.text.length > MAX_TEXT) { doc.text = doc.text.slice(0, MAX_TEXT); doc.truncated = true; }
       doc.chars = doc.text.length;
       doc.type = classify(name, doc.text, doc.sheet);
@@ -619,6 +750,7 @@
 
     return {
       at: new Date().toISOString(),
+      v: SUMMARY_V,
       genel: g.map((s) => (/[.…!?]$/.test(s) ? s : s + ".")).join(" ").replace(/\.\./g, "."),
       fields, items, tech, flags, missing, scanned, failed, unread,
       counts: Object.fromEntries(TYPE_ORDER.map((t) => [t, docs.filter((d) => d.type === t).length]))
@@ -701,7 +833,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
       if (f.type === "form") continue;
       if (f.error) { skipped.push(`${f.name} — dosya açılamadı (${f.error})`); continue; }
       const label = `${TYPES[f.type]} — ${f.name}`;
-      const txt = rec.texts[f.id];
+      const txt = repairText(rec.texts[f.id]);
       // Tamamı taranmış belgeler ile metinsiz sayfası olan / kısaltılan PDF'ler dosyanın kendisiyle gönderilir (model hem metni hem görüntüyü okur)
       const blank = blankPages(f, txt);
       const needVisual = f.scanned || (f.ext === "pdf" && (blank.length > 0 || f.truncated));
@@ -957,6 +1089,15 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
           : `<div class="card card-pad"><p>Kayıt yüklenemedi: ${esc(e.message)}</p></div>`;
         return;
       }
+      // Özet eski bir sürümle çıkarıldıysa dokümanları yeni okuyucularla tazele ve özeti yeniden hesapla
+      if (st.rec.files.length && (!st.rec.summary || st.rec.summary.v !== SUMMARY_V)) {
+        root.innerHTML = `<p class="muted">Dokümanlar güncel okuyucuyla yeniden işleniyor…</p>`;
+        try {
+          await refreshTexts((m) => { const p = root.querySelector("p"); if (p) p.textContent = m; });
+          recompute();
+          await saveRecord(ctx, st.rec);
+        } catch (e) { st.error = "Dokümanlar yeniden işlenemedi: " + (e.message || e); }
+      }
       draw();
     }
 
@@ -1140,6 +1281,31 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
       st.rec.summary = buildSummary(docs, t, ctx.keywords);
     }
 
+    // Eski okuyucuyla okunmuş Word/HTML türü dosyaları asıllarından yeniden oku; asıl yoksa kayıtlı metni onar
+    async function refreshTexts(setMsg) {
+      let changed = 0;
+      for (const f of st.rec.files) {
+        const old = st.rec.texts[f.id] || "";
+        const reread = !f.error && ["doc", "htm", "html", "rtf", "mht", "mhtml", "xml", "txt"].includes(f.ext) || (f.approx && !f.error);
+        let done = false;
+        if (reread) {
+          const blob = st.mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null);
+          if (blob) {
+            setMsg && setMsg(`Yeniden okunuyor: ${f.name}`);
+            const [d] = await extractFiles([new File([blob], f.name)]);
+            if (d && !d.error && d.text) {
+              if (d.text !== old) changed++;
+              st.rec.texts[f.id] = d.text;
+              Object.assign(f, { chars: d.chars, approx: d.approx || false, truncated: d.truncated || false, scanned: d.scanned || false, pages: d.pages });
+              done = true;
+            }
+          }
+        }
+        if (!done) { const fixed = repairText(old); if (fixed !== old) { st.rec.texts[f.id] = fixed; f.chars = fixed.length; changed++; } }
+      }
+      return changed;
+    }
+
     async function addFiles(list) {
       if (!list.length || st.busy) return;
       st.error = null;
@@ -1200,7 +1366,9 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
         if (st.rec.files.length) recompute(); else st.rec.summary = null;
         persist("Dosya kaldırıldı");
       } else if (a === "reanalyze") {
-        recompute(); persist("Yeniden analiz edildi");
+        st.busy = "Dokümanlar yeniden okunuyor…"; draw();
+        try { await refreshTexts((m) => { const b = root.querySelector("#pDrop b"); if (b) b.textContent = m; }); } catch { /* kayıtlı metinle devam */ }
+        st.busy = ""; recompute(); persist("Yeniden analiz edildi");
       } else if (a === "items") {
         st.showAllItems = !st.showAllItems; draw();
       } else if (a === "copy") {
@@ -1258,5 +1426,5 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     return { isBusy: () => !!st.busy };
   }
 
-  window.TR_PROJE = { mount, core: { extractFiles, buildSummary, classify, TYPES } };
+  window.TR_PROJE = { mount, core: { extractFiles, buildSummary, classify, repairText, TYPES } };
 })();

@@ -210,7 +210,7 @@
         else if (ext === "txt") r = { text: new TextDecoder().decode(buf) };
         else if (["htm", "html"].includes(ext)) r = { text: new DOMParser().parseFromString(new TextDecoder().decode(buf), "text/html").body.innerText || "" };
         else if (["rar", "7z"].includes(ext)) throw new Error(`${ext.toUpperCase()} arşivi tarayıcıda açılamıyor — dosyaları çıkarıp ZIP ya da tek tek yükle`);
-        else if (["jpg", "jpeg", "png", "tif", "tiff"].includes(ext)) r = { text: "", scanned: true, image: true };
+        else if (["jpg", "jpeg", "png", "webp", "tif", "tiff"].includes(ext)) r = { text: "", scanned: true, image: true };
         else throw new Error("Desteklenmeyen dosya türü");
         Object.assign(doc, r);
       } catch (e) { doc.error = e.message || String(e); }
@@ -565,7 +565,7 @@
     if (fields.kismi?.v === "Verilebilir") flag("info", "Kısmi teklif verilebilir — yalnızca uzmanlık alanındaki kısımlara teklif verme imkânı.");
     if (fields.yerli) flag("info", `Yerli istekli/yerli malı lehine ${fields.yerli.v} uygulanıyor.`);
     if (fields.altYuk && /(yaptırılamaz|verilemez|çalıştırılamaz|izin verilmemektedir)/.test(fields.altYuk.v)) flag("warn", "Alt yüklenici kullanımı kısıtlanmış.");
-    if (scanned.length) flag("warn", `${scanned.length} belge taranmış görüntü; metni okunamadı (${scanned.slice(0, 3).join(", ")}${scanned.length > 3 ? "…" : ""}). Yapay zekâ özeti bu belgeleri görsel olarak okuyabilir.`);
+    if (scanned.length) flag("warn", `${scanned.length} belge taranmış görüntü (${scanned.slice(0, 3).join(", ")}${scanned.length > 3 ? "…" : ""}); bu özete dahil edilemedi. Aşağıdaki "Yapay zekâ ile detaylı özet" bu belgeleri görsel olarak okur.`);
     if (missing.length) flag("warn", `Bulunamayan doküman: ${missing.map((t) => TYPES[t]).join(", ")}.`);
     if (failed.length) flag("warn", `${failed.length} dosya okunamadı: ${failed.slice(0, 3).map((x) => x.name).join(", ")}.`);
 
@@ -662,26 +662,31 @@ Görevin, teklif verip vermemeye karar verecek ve teklifi hazırlayacak ekip iç
 Yalnızca dokümanlarda yazanlara dayan; bilgi yoksa "Belirtilmemiş" yaz, tahmin etme. Önemli bilginin hangi dokümandan geldiğini gerektiğinde parantez içinde kısaca belirt (ör. "(Teknik Ş. md. 4.2)").
 Kısa ve net yaz; maddeler tek cümle olsun.`;
 
-  // Gönderilecek dokümanlar: metni okunan belgeler metin olarak, taranmış PDF'ler dosya olarak (model görsel okur).
+  // Gönderilecek dokümanlar: metni okunan belgeler metin olarak; taranmış PDF'ler ve resimler dosya olarak (model görsel okur).
   // Yalnızca ihale dokümanları gönderilir; notlar, müşteri kartları vb. asla gönderilmez.
-  async function collectDocs(ctx, rec, mem, maxPdfBytes) {
-    const out = [];
+  const VISUAL_MIME = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
+  async function collectDocs(ctx, rec, mem, opts) {
+    const out = [], skipped = [];
     const files = [...rec.files].sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
-    let pdfBytes = 0;
     for (const f of files) {
-      if (f.type === "form") continue;
+      if (f.type === "form" || f.error) continue;
       const label = `${TYPES[f.type]} — ${f.name}`;
       const txt = rec.texts[f.id];
-      if (f.scanned && f.ext === "pdf" && pdfBytes + f.size < maxPdfBytes) {
+      if (f.scanned) {
+        const mime = VISUAL_MIME[f.ext];
+        if (!mime) { skipped.push(`${f.name} (${(f.ext || "").toUpperCase()} biçimi okunamıyor; PDF ya da JPG olarak kaydedip yükle)`); continue; }
+        if (!opts.accepts(mime, f.size)) { skipped.push(`${f.name} (${opts.limitText(mime)})`); continue; }
         const blob = mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null);
-        if (blob) { pdfBytes += f.size; out.push({ kind: "pdf", label, b64: await blobToBase64(blob) }); continue; }
+        if (!blob) { skipped.push(`${f.name} (dosya bu cihazda yok; yeniden yükle)`); continue; }
+        out.push({ kind: "file", label, mime, blob, size: f.size, name: f.name });
+        continue;
       }
       if (txt) out.push({ kind: "text", label, text: txt });
     }
-    if (!out.length) throw new Error("Yapay zekâya gönderilecek okunabilir doküman yok");
+    if (!out.length) throw new Error("Yapay zekâya gönderilecek okunabilir doküman yok" + (skipped.length ? ": " + skipped.join("; ") : ""));
     const chars = out.reduce((a, d) => a + (d.text || "").length, 0);
     if (chars / 3 > 900000) throw new Error("Dokümanlar modelin okuyabileceğinden uzun; gereksiz dosyaları (ekler, formlar) listeden çıkarıp tekrar dene");
-    return out;
+    return { docs: out, skipped };
   }
   function aiInstruction(t) {
     return `İhale: ${t.title}\nİdare: ${t.authority}${t.ikn ? "\nİKN: " + t.ikn : ""}${t.tenderDate ? "\nPanelde kayıtlı ihale tarihi: " + new Date(t.tenderDate).toLocaleString("tr-TR") : ""}\n\nYukarıdaki dokümanların tamamını inceleyip proje özetini istenen yapıda hazırla.`;
@@ -723,12 +728,45 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     const key = lsGet(PROVIDERS.gemini.keyStore);
     if (!key) throw new Error("Gemini API anahtarı girilmemiş");
     const model = lsGet(GMODEL_STORE) || GEMINI_MODELS[0][0];
-    const docs = await collectDocs(ctx, rec, mem, 12e6);   // istek sınırı ~20 MB; base64 %33 büyütür
-    const parts = [];
-    for (const d of docs) {
-      if (d.kind === "pdf") parts.push({ text: `### ${d.label} (taranmış PDF)` }, { inline_data: { mime_type: "application/pdf", data: d.b64 } });
-      else parts.push({ text: `### ${d.label}\n\n${d.text}` });
+    const { docs, skipped } = await collectDocs(ctx, rec, mem, {
+      accepts: (mime, size) => size <= 1.9e9, limitText: () => "dosya 2 GB'tan büyük"
+    });
+    // Küçük görseller isteğe gömülür (toplam ~10 MB); büyükler Gemini dosya servisine yüklenir ve iş bitince silinir
+    const GBASE = "https://generativelanguage.googleapis.com";
+    const uploaded = [];
+    async function uploadFile(d) {
+      const fd = new FormData();
+      fd.append("metadata", new Blob([JSON.stringify({ file: { display_name: d.name.slice(0, 120) } })], { type: "application/json" }));
+      fd.append("file", new Blob([d.blob], { type: d.mime }), d.name);
+      const r = await fetch(`${GBASE}/upload/v1beta/files?uploadType=multipart`, { method: "POST", headers: { "x-goog-api-key": key }, body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.file) { const e = new Error(`Gemini dosya yükleme ${r.status}: ${(j.error && j.error.message) || r.statusText}`); e.status = r.status; throw e; }
+      let file = j.file;
+      uploaded.push(file.name);
+      for (let i = 0; i < 60 && file.state === "PROCESSING"; i++) {   // büyük PDF'ler birkaç saniye işlenebilir
+        await new Promise((res) => setTimeout(res, 2000));
+        const g = await fetch(`${GBASE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": key } });
+        file = (await g.json().catch(() => null)) || file;
+      }
+      if (file.state === "FAILED") throw new Error(`${d.name} Gemini tarafından işlenemedi`);
+      return file;
     }
+    const cleanup = () => uploaded.splice(0).forEach((nm) => fetch(`${GBASE}/v1beta/${nm}`, { method: "DELETE", headers: { "x-goog-api-key": key } }).catch(() => {}));
+    const parts = [];
+    let inline = 0, visual = 0;
+    try {
+      for (const d of docs) {
+        if (d.kind !== "file") { parts.push({ text: `### ${d.label}\n\n${d.text}` }); continue; }
+        visual++;
+        parts.push({ text: `### ${d.label} (taranmış belge — görsel olarak oku)` });
+        if (inline + d.size <= 10e6) { inline += d.size; parts.push({ inline_data: { mime_type: d.mime, data: await blobToBase64(d.blob) } }); }
+        else {
+          onProgress && onProgress(`Taranmış belge Gemini'ye yükleniyor: ${d.name} (${(d.size / 1048576).toFixed(1)} MB)`);
+          const file = await uploadFile(d);
+          parts.push({ file_data: { mime_type: file.mimeType || d.mime, file_uri: file.uri } });
+        }
+      }
+    } catch (e) { cleanup(); throw e; }
     parts.push({ text: aiInstruction(ctx.tender) });
     const body = JSON.stringify({
       systemInstruction: { parts: [{ text: AI_SYSTEM }] },
@@ -749,13 +787,15 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
       return j;
     }
     let used = null, j = null, lastErr = null;
-    for (const m of [...new Set([model, ...GEMINI_CHAIN])]) {
-      try { j = await call(m); used = m; break; }
-      catch (e) {
-        lastErr = e;
-        if (!(e.status === 429 || e.status === 404 || e.status === 500 || e.status === 503)) throw e;   // anahtar/istek hatası: diğer modeller de aynı sonucu verir
+    try {
+      for (const m of [...new Set([model, ...GEMINI_CHAIN])]) {
+        try { j = await call(m); used = m; break; }
+        catch (e) {
+          lastErr = e;
+          if (!(e.status === 429 || e.status === 404 || e.status === 500 || e.status === 503)) throw e;   // anahtar/istek hatası: diğer modeller de aynı sonucu verir
+        }
       }
-    }
+    } finally { cleanup(); }
     if (!j) throw lastErr;
     const cand = j.candidates && j.candidates[0];
     if (!cand) throw new Error("Gemini yanıt vermedi" + (j.promptFeedback && j.promptFeedback.blockReason ? ` (engellendi: ${j.promptFeedback.blockReason})` : ""));
@@ -763,7 +803,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     if (cand.finishReason && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(cand.finishReason) && !(cand.content && cand.content.parts)) throw new Error(`Gemini yanıtı tamamlamadı (${cand.finishReason})`);
     const txt = ((cand.content && cand.content.parts) || []).filter((p) => p.text && !p.thought).map((p) => p.text).join("");
     const u = j.usageMetadata || {};
-    return { ...normalizeAi(parseJsonLoose(txt)), provider: "gemini", model: j.modelVersion || used, at: new Date().toISOString(),
+    return { ...normalizeAi(parseJsonLoose(txt)), provider: "gemini", model: j.modelVersion || used, at: new Date().toISOString(), visual, skipped,
       usage: { input: u.promptTokenCount, output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0), free: true } };
   }
 
@@ -773,10 +813,22 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     if (!key) throw new Error("Claude API anahtarı girilmemiş");
     const { default: Anthropic } = await import(LIB.sdk);
     const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
-    const docs = await collectDocs(ctx, rec, mem, 25e6);
-    const content = docs.map((d) => d.kind === "pdf"
-      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: d.b64 }, title: d.label }
-      : { type: "text", text: `### ${d.label}\n\n${d.text}` });
+    // Claude isteği en fazla ~32 MB; resimler tek tek en fazla 5 MB
+    let budget = 22e6;
+    const { docs, skipped } = await collectDocs(ctx, rec, mem, {
+      accepts: (mime, size) => { const ok = mime === "application/pdf" ? size <= budget : size <= 5e6 && size <= budget; if (ok) budget -= size; return ok; },
+      limitText: (mime) => (mime === "application/pdf" ? "taranmış PDF'lerin toplamı Claude'un istek sınırını aşıyor" : "resim 5 MB'tan büyük")
+    });
+    let visual = 0;
+    const content = [];
+    for (const d of docs) {
+      if (d.kind !== "file") { content.push({ type: "text", text: `### ${d.label}\n\n${d.text}` }); continue; }
+      visual++;
+      const data = await blobToBase64(d.blob);
+      content.push(d.mime === "application/pdf"
+        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data }, title: d.label }
+        : { type: "text", text: `### ${d.label} (taranmış belge)` }, ...(d.mime === "application/pdf" ? [] : [{ type: "image", source: { type: "base64", media_type: d.mime, data } }]));
+    }
     content.push({ type: "text", text: aiInstruction(ctx.tender) });
     onProgress && onProgress("Claude dokümanları okuyor…");
 
@@ -798,7 +850,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     const txt = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
     const u = msg.usage || {};
     const cost = ((u.input_tokens || 0) * 4 + (u.output_tokens || 0) * 20) / 1e6;
-    return { ...normalizeAi(parseJsonLoose(txt)), provider: "claude", model: msg.model, at: new Date().toISOString(),
+    return { ...normalizeAi(parseJsonLoose(txt)), provider: "claude", model: msg.model, at: new Date().toISOString(), visual, skipped,
       usage: { input: u.input_tokens, output: u.output_tokens, costUsd: Math.round(cost * 100) / 100 } };
   }
   // Word raporu modülü (assets/js/rapor.js) ilk kullanımda yüklenir
@@ -880,9 +932,9 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
             ${rec.files.length ? `<button class="btn small" data-p="reanalyze" type="button" ${st.busy ? "disabled" : ""}>↻ Yeniden analiz et</button>` : ""}
           </div>
           <label class="dropzone ${st.busy ? "busy" : ""}" id="pDrop">
-            <input type="file" id="pFile" multiple accept=".zip,.pdf,.docx,.doc,.xlsx,.xls,.xlsm,.ods,.csv,.txt,.htm,.html" hidden ${st.busy ? "disabled" : ""}>
+            <input type="file" id="pFile" multiple accept=".zip,.pdf,.docx,.doc,.xlsx,.xls,.xlsm,.ods,.csv,.txt,.htm,.html,.jpg,.jpeg,.png,.webp,.tif,.tiff" hidden ${st.busy ? "disabled" : ""}>
             <b>${st.busy ? esc(st.busy) : "Dokümanları buraya sürükle ya da tıklayıp seç"}</b>
-            <span class="muted small">${st.busy ? "" : "EKAP'tan indirdiğin ZIP'i olduğu gibi bırakabilirsin; PDF, Word, Excel de olur. İdari + teknik şartname + birim fiyat cetveli + sözleşme tasarısı birlikte en iyi sonucu verir."}</span>
+            <span class="muted small">${st.busy ? "" : "EKAP'tan indirdiğin ZIP'i olduğu gibi bırakabilirsin; PDF, Word, Excel ve taranmış sayfa resimleri (JPG, PNG) de olur. İdari + teknik şartname + birim fiyat cetveli + sözleşme tasarısı birlikte en iyi sonucu verir."}</span>
           </label>
           ${t.ekapUrl ? `<p class="muted small" style="margin:8px 0 0">EKAP'ta: <a href="${esc(t.ekapUrl)}" target="_blank" rel="noopener">ihaleyi aç ↗</a> → <b>İhale Dokümanı</b> → indir (e-imza/EKAP girişi gerekebilir) → indirilen ZIP'i buraya bırak.</p>` : ""}
           ${st.error ? `<p class="small" style="color:var(--urgent);margin:8px 0 0">${esc(st.error)}</p>` : ""}
@@ -1007,6 +1059,8 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
               ${L("Açıklama talebi için sorular", ai.sorulacak_sorular)}
               ${L("Eksik veya belirsiz", ai.eksik_veya_belirsiz)}
             </div>
+            ${ai.visual ? `<p class="small" style="margin:10px 0 0">✓ ${ai.visual} taranmış belge görsel olarak okundu.</p>` : ""}
+            ${ai.skipped && ai.skipped.length ? `<p class="small" style="margin:6px 0 0;color:var(--week)">Okunamayan belgeler: ${esc(ai.skipped.join("; "))}</p>` : ""}
             <p class="muted small" style="margin:10px 0 0">${esc(PROVIDERS[ai.provider || "claude"]?.label || "")} · ${esc(ai.model || "")} · ${new Date(ai.at).toLocaleString("tr-TR")}${ai.usage ? ` · ${(ai.usage.input || 0).toLocaleString("tr-TR")} + ${(ai.usage.output || 0).toLocaleString("tr-TR")} token${ai.usage.free ? " (ücretsiz kota)" : ai.usage.costUsd != null ? ` ≈ $${ai.usage.costUsd}` : ""}` : ""}. Yapay zekâ hata yapabilir; kritik bilgileri dokümandan teyit et.</p>` : ""}
         </div>`;
     }

@@ -1051,18 +1051,19 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     return { ...normalizeAi(parseJsonLoose(txt)), provider: "claude", model: msg.model, at: new Date().toISOString(), visual, skipped,
       usage: { input: u.input_tokens, output: u.output_tokens, costUsd: Math.round(cost * 100) / 100 } };
   }
-  // Word raporu modülü (assets/js/rapor.js) ilk kullanımda yüklenir
-  let reportLib = null;
-  function loadReportLib() {
-    if (window.TR_RAPOR) return Promise.resolve();
-    return reportLib || (reportLib = new Promise((res, rej) => {
+  // Word raporu (rapor.js) ve Bid/No-Bid sunumu (sunum.js) modülleri ilk kullanımda, proje.js ile aynı sürümden yüklenir
+  const modLoads = {};
+  function loadModule(file, globalName) {
+    if (window[globalName]) return Promise.resolve();
+    return modLoads[file] || (modLoads[file] = new Promise((res, rej) => {
       const me = [...document.scripts].find((x) => /proje\.js/.test(x.src));
       const s = document.createElement("script");
-      s.src = me ? me.src.replace(/proje\.js/, "rapor.js") : "assets/js/rapor.js";
-      s.onload = res; s.onerror = () => { reportLib = null; rej(new Error("rapor.js yüklenemedi")); };
+      s.src = me ? me.src.replace(/proje\.js/, file) : "assets/js/" + file;
+      s.onload = res; s.onerror = () => { delete modLoads[file]; rej(new Error(file + " yüklenemedi")); };
       document.head.appendChild(s);
     }));
   }
+  const loadReportLib = () => loadModule("rapor.js", "TR_RAPOR");
   function aiErrorText(pv, err) {
     const m = String((err && err.message) || err);
     const s = err && err.status;
@@ -1139,8 +1140,11 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
       const s = rec.summary;
       root.innerHTML = `
         ${s ? `<div class="report-bar">
-          <div><b>İhale Özet Raporu</b> <span class="muted small">Word (.docx) · hazırlayan Muhammet Emin Gülay · ${new Date().toLocaleDateString("tr-TR")}${rec.ai ? " · yapay zekâ özeti dahil" : ""}</span></div>
-          <button class="btn primary" data-p="word" type="button" ${st.busy ? "disabled" : ""}>📄 Word raporu indir</button>
+          <div><b>Rapor ve sunum</b> <span class="muted small">hazırlayan Muhammet Emin Gülay · ${new Date().toLocaleDateString("tr-TR")}${rec.ai ? " · yapay zekâ özeti dahil" : ""}</span></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn primary" data-p="word" type="button" ${st.busy ? "disabled" : ""} title="Detaylı İhale Özet Raporu (Word)">📄 Word raporu indir</button>
+            <button class="btn primary" data-p="pptx" type="button" ${st.busy ? "disabled" : ""} title="Yönetici için 4 sayfalık sade sunum: ihale adı ve tarihi, kapsam, finansal riskler, proje riskleri">📊 Bid/No-Bid sunumu indir</button>
+          </div>
         </div>` : ""}
         <div class="card card-pad proje-docs">
           <div class="proje-docs-head">
@@ -1406,6 +1410,14 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
         st.showAllItems = !st.showAllItems; draw();
       } else if (a === "copy") {
         navigator.clipboard?.writeText(summaryText()).then(() => ctx.toast && ctx.toast("Proje özeti panoya kopyalandı"), () => ctx.toast && ctx.toast("Kopyalanamadı"));
+      } else if (a === "pptx") {
+        el.disabled = true; const label = el.textContent; el.textContent = "Sunum hazırlanıyor…";
+        try {
+          await loadModule("sunum.js", "TR_SUNUM");
+          const name = await window.TR_SUNUM.download({ tender: t, rec: st.rec });
+          ctx.toast && ctx.toast("Bid/No-Bid sunumu indirildi: " + name);
+        } catch (err) { st.error = "Sunum oluşturulamadı: " + (err.message || err); draw(); return; }
+        el.disabled = false; el.textContent = label;
       } else if (a === "word") {
         el.disabled = true; const label = el.textContent; el.textContent = "Rapor hazırlanıyor…";
         try {

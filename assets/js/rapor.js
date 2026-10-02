@@ -92,6 +92,13 @@
     const idare = f.idare?.v || t.authority || "";
     const tDate = t.tenderDate ? new Date(t.tenderDate) : null;
     const daysLeft = tDate ? Math.ceil((tDate - now) / 864e5) : null;
+    // İhale türü: idari şartname → bülten/ilan türü → ilan kategorileri → özet künyesi → iş adı (sırayla, ilk bulunan)
+    const TUR_RX = [[/danışman/i, "Danışmanlık hizmeti"], [/yapım/i, "Yapım işi"], [/hizmet/i, "Hizmet alımı"], [/\bmal\b|mal alım|\balım/i, "Mal alımı"]];
+    const turOf = (str) => { const v = String(str || ""); for (const [rx, label] of TUR_RX) if (rx.test(v)) return label; return ""; };
+    const ihaleTuru = f.tur?.v || turOf(t.tur) || turOf((t.categories || []).find((c) => /alım|hizmet|yapım|danışman|\bmal\b/i.test(c)))
+      || turOf(K.ihale_turu_usulu) || turOf(`${t.title || ""} ${f.isAdi?.v || ""}`);
+    // Durum: iptal → İptal edildi; ihale saati gelmediyse → Devam ediyor; geçtiyse → İhale tarihi geçti
+    const durum = t.isCancelled ? "İptal edildi" : !tDate ? (watch ? STATUS[watch.status] || "İnceleniyor" : "İnceleniyor") : tDate > now ? "Devam ediyor" : "İhale tarihi geçti";
     const reportNo = `İÖR-${now.toISOString().slice(0, 10).replace(/-/g, "")}-${(t.ikn || t.refNo || t.id || "").replace(/\D/g, "").slice(-6) || "0001"}`;
     const children = [];
 
@@ -112,10 +119,10 @@
         tile("İl", t.city || "")
       ] }),
       new TableRow({ children: [
-        tile("İhale türü", f.tur?.v || ""),
+        tile("İhale türü", ihaleTuru),
         tile("Usul", f.usul?.v || t.procedure || ""),
         tile("Teklif şekli", f.eteklif ? "e-teklif (EKAP)" : ""),
-        tile("Durum", watch ? STATUS[watch.status] || "İnceleniyor" : "İnceleniyor")
+        tile("Durum", durum)
       ] })
     ]));
     children.push(text("", { after: 160 }));
@@ -137,7 +144,7 @@
     const row = (label, field, aiVal) => { const [v, src] = pick(field, aiVal); return [label, v, src]; };
     children.push(...kvTable([
       row("İdare", f.idare, K.idare || t.authority), row("İşin adı", f.isAdi, K.isin_adi || t.title), row("İdare adresi", f.adres),
-      row("İhale türü / usulü", f.tur && f.usul ? { v: `${f.tur.v}, ${f.usul.v}`, src: f.usul.src } : f.tur || f.usul, K.ihale_turu_usulu),
+      row("İhale türü / usulü", f.tur && f.usul ? { v: `${f.tur.v}, ${f.usul.v}`, src: f.usul.src } : f.tur || (f.usul && ihaleTuru ? { v: `${ihaleTuru}, ${f.usul.v}`, src: f.usul.src } : f.usul), K.ihale_turu_usulu || ihaleTuru),
       row("İhale tarihi ve saati", f.tarih, K.ihale_tarihi || (tDate ? fmtDate(tDate, true) : "")),
       row("Teklif şekli", f.eteklif), row("Teklif verilecek yer", f.toplanti),
       row("Teslim / iş yeri", f.yer, K.yer || t.city), row("Süre", f.sure || f.teslimSure, K.sure),

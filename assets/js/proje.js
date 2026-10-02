@@ -533,6 +533,33 @@
     const m = String(s || "").match(/(\d{1,2})[./](\d{1,2})[./](\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
     return m ? new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 23), +(m[5] || 59)) : null;
   }
+  // ---------- Okunamayan kısımlar ----------
+  // Metin katmanı olmayan sayfalar: metin PDF'i içinde taranmış ekler, imzalı sayfalar vb.
+  function blankPages(f, text) {
+    if (f.ext !== "pdf" || !f.pages || f.scanned || f.error) return [];
+    const out = [];
+    String(text || "").split("\f").forEach((p, i) => { if ((p.match(/\p{L}/gu) || []).length < 25) out.push(i + 1); });
+    return out;
+  }
+  const pageRanges = (arr) => {
+    const r = [];
+    for (const n of arr) { const last = r[r.length - 1]; if (last && n === last[1] + 1) last[1] = n; else r.push([n, n]); }
+    return r.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(", ");
+  };
+  // Kural tabanlı özetin okuyamadığı kısımlar: [{ name, kind, text }]
+  function unreadParts(docs) {
+    const out = [];
+    for (const d of docs) {
+      if (d.error) { out.push({ name: d.name, kind: "error", text: `Dosya açılamadı: ${d.error}` }); continue; }
+      if (d.scanned) { out.push({ name: d.name, kind: "scanned", text: d.image ? "Resim dosyası (taranmış sayfa); metni okunamadı" : `Tamamı taranmış görüntü${d.pages ? ` (${d.pages} sayfa)` : ""}; metni okunamadı` }); continue; }
+      const blank = blankPages(d, d.text);
+      if (blank.length) out.push({ name: d.name, kind: "pages", pages: blank, text: `${blank.length === 1 ? "Sayfa" : "Sayfalar"} ${pageRanges(blank)} metin içermiyor (taranmış ya da boş sayfa); bu sayfalardaki bilgiler okunamadı` });
+      if (d.truncated) out.push({ name: d.name, kind: "truncated", text: `Doküman çok uzun; ilk ${MAX_TEXT.toLocaleString("tr-TR")} karakter okundu, kalan kısım okunmadı` });
+      if (d.approx) out.push({ name: d.name, kind: "approx", text: "Eski Word (.doc) biçimi; metin yaklaşık okundu, tablolar ve biçimli alanlar eksik olabilir (DOCX ya da PDF olarak yüklemek daha güvenilir)" });
+    }
+    return out;
+  }
+
   function buildSummary(docs, tender, userKw) {
     docs.forEach((d) => { delete d._flat; delete d._lines; });
     const fields = extractFields(docs);
@@ -565,9 +592,9 @@
     if (fields.kismi?.v === "Verilebilir") flag("info", "Kısmi teklif verilebilir — yalnızca uzmanlık alanındaki kısımlara teklif verme imkânı.");
     if (fields.yerli) flag("info", `Yerli istekli/yerli malı lehine ${fields.yerli.v} uygulanıyor.`);
     if (fields.altYuk && /(yaptırılamaz|verilemez|çalıştırılamaz|izin verilmemektedir)/.test(fields.altYuk.v)) flag("warn", "Alt yüklenici kullanımı kısıtlanmış.");
-    if (scanned.length) flag("warn", `${scanned.length} belge taranmış görüntü (${scanned.slice(0, 3).join(", ")}${scanned.length > 3 ? "…" : ""}); bu özete dahil edilemedi. Aşağıdaki "Yapay zekâ ile detaylı özet" bu belgeleri görsel olarak okur.`);
     if (missing.length) flag("warn", `Bulunamayan doküman: ${missing.map((t) => TYPES[t]).join(", ")}.`);
-    if (failed.length) flag("warn", `${failed.length} dosya okunamadı: ${failed.slice(0, 3).map((x) => x.name).join(", ")}.`);
+    // Okunamayan kısımlar ayrı bir uyarı kutusunda gösterilir (taranmış dosyalar, metinsiz sayfalar, açılamayan/kısaltılan dosyalar)
+    const unread = unreadParts(docs);
 
     // Genel özet paragrafı
     const g = [];
@@ -593,7 +620,7 @@
     return {
       at: new Date().toISOString(),
       genel: g.map((s) => (/[.…!?]$/.test(s) ? s : s + ".")).join(" ").replace(/\.\./g, "."),
-      fields, items, tech, flags, missing, scanned, failed,
+      fields, items, tech, flags, missing, scanned, failed, unread,
       counts: Object.fromEntries(TYPE_ORDER.map((t) => [t, docs.filter((d) => d.type === t).length]))
     };
   }
@@ -633,7 +660,7 @@
   const A = (d) => ({ type: "array", items: { type: "string" }, description: d });
   const AI_SCHEMA = {
     type: "object", additionalProperties: false,
-    required: ["genel_ozet", "kunye", "kapsam", "ana_kalemler", "teknik_gereksinimler", "yeterlik_ve_mali_sartlar", "riskler", "sorulacak_sorular", "eksik_veya_belirsiz"],
+    required: ["genel_ozet", "kunye", "kapsam", "ana_kalemler", "teknik_gereksinimler", "yeterlik_ve_mali_sartlar", "riskler", "sorulacak_sorular", "eksik_veya_belirsiz", "okunamayan_kisimlar"],
     properties: {
       genel_ozet: S("Projenin 5-8 cümlelik genel özeti: ne alınıyor/yapılıyor, nerede, ne zaman, ölçeği ve öne çıkan özellikleri"),
       kunye: {
@@ -653,14 +680,16 @@
       yeterlik_ve_mali_sartlar: A("İş deneyimi, benzer iş, teminatlar, fiyat farkı, avans, ceza, ödeme şartları"),
       riskler: A("Teklif veren firma açısından riskler ve dikkat edilmesi gerekenler"),
       sorulacak_sorular: A("İdareye açıklama talebi olarak sorulabilecek belirsizlikler"),
-      eksik_veya_belirsiz: A("Dokümanlarda bulunamayan veya çelişkili bilgiler")
+      eksik_veya_belirsiz: A("Dokümanlarda bulunamayan veya çelişkili bilgiler"),
+      okunamayan_kisimlar: A("Okuyamadığın ya da emin olamadığın kısımlar: bulanık, kesik, düşük çözünürlüklü, el yazısı, kaşe/imza altında kalan veya boş görünen sayfa/bölümler. Her madde için doküman adı ve sayfa/bölüm belirt. Her şey okunduysa boş liste.")
     }
   };
   const AI_SYSTEM = `Sen, SCADA, otomasyon ve enerji dağıtım projelerine teklif veren bir firmada kıdemli ihale/iş geliştirme uzmanısın.
 Sana bir ihalenin dokümanları (idari şartname, teknik şartname, birim fiyat cetveli, sözleşme tasarısı vb.) verilecek.
 Görevin, teklif verip vermemeye karar verecek ve teklifi hazırlayacak ekip için tüm dokümanları birlikte değerlendirip Türkçe bir proje özeti çıkarmak.
 Yalnızca dokümanlarda yazanlara dayan; bilgi yoksa "Belirtilmemiş" yaz, tahmin etme. Önemli bilginin hangi dokümandan geldiğini gerektiğinde parantez içinde kısaca belirt (ör. "(Teknik Ş. md. 4.2)").
-Kısa ve net yaz; maddeler tek cümle olsun.`;
+Kısa ve net yaz; maddeler tek cümle olsun.
+Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin olmadığın her sayfa/bölümü (özellikle rakam, tarih, oran içerenleri) okunamayan_kisimlar alanında açıkça belirt — tahminle doldurma.`;
 
   // Gönderilecek dokümanlar: metni okunan belgeler metin olarak; taranmış PDF'ler ve resimler dosya olarak (model görsel okur).
   // Yalnızca ihale dokümanları gönderilir; notlar, müşteri kartları vb. asla gönderilmez.
@@ -669,17 +698,24 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     const out = [], skipped = [];
     const files = [...rec.files].sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
     for (const f of files) {
-      if (f.type === "form" || f.error) continue;
+      if (f.type === "form") continue;
+      if (f.error) { skipped.push(`${f.name} — dosya açılamadı (${f.error})`); continue; }
       const label = `${TYPES[f.type]} — ${f.name}`;
       const txt = rec.texts[f.id];
-      if (f.scanned) {
+      // Tamamı taranmış belgeler ile metinsiz sayfası olan / kısaltılan PDF'ler dosyanın kendisiyle gönderilir (model hem metni hem görüntüyü okur)
+      const blank = blankPages(f, txt);
+      const needVisual = f.scanned || (f.ext === "pdf" && (blank.length > 0 || f.truncated));
+      if (needVisual) {
         const mime = VISUAL_MIME[f.ext];
-        if (!mime) { skipped.push(`${f.name} (${(f.ext || "").toUpperCase()} biçimi okunamıyor; PDF ya da JPG olarak kaydedip yükle)`); continue; }
-        if (!opts.accepts(mime, f.size)) { skipped.push(`${f.name} (${opts.limitText(mime)})`); continue; }
-        const blob = mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null);
-        if (!blob) { skipped.push(`${f.name} (dosya bu cihazda yok; yeniden yükle)`); continue; }
-        out.push({ kind: "file", label, mime, blob, size: f.size, name: f.name });
-        continue;
+        let why = !mime ? `${(f.ext || "").toUpperCase()} biçimi okunamıyor; PDF ya da JPG olarak kaydedip yükle` : !opts.accepts(mime, f.size) ? opts.limitText(mime) : null;
+        let blob = null;
+        if (!why) { blob = mem.get(f.id) || (ctx.cloud && f.storagePath ? await downloadBlob(ctx, f.storagePath) : null); if (!blob) why = "dosya bu cihazda yok; yeniden yükle"; }
+        if (!why) { out.push({ kind: "file", label, mime, blob, size: f.size, name: f.name, partial: !f.scanned }); continue; }
+        if (f.scanned) { skipped.push(`${f.name} — taranmış belge gönderilemedi (${why})`); continue; }
+        skipped.push(`${f.name} — ${blank.length ? `sayfa ${pageRanges(blank)} metin içermiyor` : "dokümanın kısaltılan son kısmı"} ve görsel olarak gönderilemedi (${why}); yalnızca metin kısmı okundu`);
+      } else {
+        if (f.truncated) skipped.push(`${f.name} — doküman çok uzun; ilk ${MAX_TEXT.toLocaleString("tr-TR")} karakteri okundu, kalan kısım okunmadı`);
+        if (f.approx) skipped.push(`${f.name} — eski .doc biçimi; metin yaklaşık okundu, tablolar eksik olabilir`);
       }
       if (txt) out.push({ kind: "text", label, text: txt });
     }
@@ -697,7 +733,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     return {
       genel_ozet: String(o.genel_ozet || ""), kunye: o.kunye && typeof o.kunye === "object" ? o.kunye : {},
       kapsam: arr(o.kapsam), ana_kalemler: arr(o.ana_kalemler).filter((x) => typeof x === "object"), teknik_gereksinimler: arr(o.teknik_gereksinimler),
-      yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz)
+      yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz), okunamayan_kisimlar: arr(o.okunamayan_kisimlar)
     };
   }
   function parseJsonLoose(txt) {
@@ -758,7 +794,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
       for (const d of docs) {
         if (d.kind !== "file") { parts.push({ text: `### ${d.label}\n\n${d.text}` }); continue; }
         visual++;
-        parts.push({ text: `### ${d.label} (taranmış belge — görsel olarak oku)` });
+        parts.push({ text: `### ${d.label} ${d.partial ? "(PDF — bazı sayfaları taranmış; metin ve görüntü sayfalarının tamamını oku)" : "(taranmış belge — görsel olarak oku)"}` });
         if (inline + d.size <= 10e6) { inline += d.size; parts.push({ inline_data: { mime_type: d.mime, data: await blobToBase64(d.blob) } }); }
         else {
           onProgress && onProgress(`Taranmış belge Gemini'ye yükleniyor: ${d.name} (${(d.size / 1048576).toFixed(1)} MB)`);
@@ -899,6 +935,12 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
     return `<span class="src-chip" title="${esc(src.name)}${src.page ? " · sayfa " + src.page : ""}">${short}${src.page ? " s." + src.page : ""}</span>`;
   }
   const kvRow = (label, f, fallback) => (f || fallback) ? `<dt>${label}</dt><dd>${f ? esc(f.v) + " " + srcChip(f.src) : `<span class="muted">${esc(fallback)}</span>`}</dd>` : "";
+  // Okunamayan kısımlar uyarı kutusu: rows = [[dosya adı, açıklama], …]
+  function unreadBox(title, rows, note) {
+    return `<div class="unread-box" role="alert"><b>⚠ ${esc(title)}</b>
+      <ul>${rows.map(([n, d]) => `<li>${n ? `<span class="unread-file">${esc(n)}</span> — ` : ""}${esc(d)}</li>`).join("")}</ul>
+      ${note ? `<p>${note}</p>` : ""}</div>`;
+  }
   const fmtSize = (n) => (n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
 
   function mount(root, ctx) {
@@ -944,7 +986,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
               <td>${f.storagePath && ctx.cloud ? `<a href="#" data-p="open" data-id="${esc(f.id)}">${esc(f.name)}</a>` : esc(f.name)}${f.path !== f.name ? `<div class="muted" style="font-size:11px">${esc(f.path)}</div>` : ""}</td>
               <td><select data-ptype="${esc(f.id)}">${TYPE_ORDER.map((k) => `<option value="${k}" ${f.type === k ? "selected" : ""}>${TYPES[k]}</option>`).join("")}</select></td>
               <td>${f.pages || "—"}</td>
-              <td>${f.error ? `<span style="color:var(--urgent)" title="${esc(f.error)}">okunamadı</span>` : f.scanned ? `<span style="color:var(--week)" title="Metin katmanı yok (taranmış görüntü)">taranmış</span>` : `${(f.chars || 0) < 1000 ? (f.chars || 0) + " kr." : Math.round(f.chars / 1000) + "k kr."}${f.truncated ? " (kısaltıldı)" : ""}${f.approx ? " ~" : ""}`}</td>
+              <td>${f.error ? `<span style="color:var(--urgent)" title="${esc(f.error)}">okunamadı</span>` : f.scanned ? `<span style="color:var(--week)" title="Metin katmanı yok (taranmış görüntü)">taranmış</span>` : `${(f.chars || 0) < 1000 ? (f.chars || 0) + " kr." : Math.round(f.chars / 1000) + "k kr."}${(() => { const b = blankPages(f, rec.texts[f.id]); return b.length ? ` <span style="color:var(--week)" title="Bu sayfalarda metin yok (taranmış ya da boş)">· s. ${pageRanges(b)} okunamadı</span>` : ""; })()}${f.truncated ? ` <span style="color:var(--week)">(kısaltıldı)</span>` : ""}${f.approx ? ` <span style="color:var(--week)" title="Eski .doc biçimi, yaklaşık okundu">~ yaklaşık</span>` : ""}`}</td>
               <td><button class="btn ghost small" data-p="del" data-id="${esc(f.id)}" title="Dosyayı kaldır" type="button">✕</button></td></tr>`).join("")}</tbody></table></div>` : ""}
         </div>
         ${s ? summaryHtml(s) : rec.files.length ? "" : `<div class="card card-pad"><p class="muted" style="margin:0">Dokümanları yükleyince ihale künyesi, kapsam, kalem listesi, teknik öne çıkanlar, yeterlik/mali şartlar ve dikkat edilecekler burada oluşur.</p></div>`}
@@ -958,6 +1000,11 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
         <div class="card card-pad proje-sum">
           <div class="proje-docs-head"><h3 style="margin:0">Proje özeti</h3>
             <div style="display:flex;gap:6px"><button class="btn small" data-p="copy" type="button">⧉ Kopyala</button><button class="btn small" data-p="print" type="button">🖨 Yazdır</button></div></div>
+          ${(() => {
+            const unread = s.unread || unreadParts(st.rec.files.map((x) => ({ ...x, text: st.rec.texts[x.id] || "" })));
+            return unread.length ? unreadBox("Okunamayan kısımlar — bu özete dahil edilmedi", unread.map((u) => [u.name, u.text]),
+              unread.some((u) => ["scanned", "pages", "truncated"].includes(u.kind)) ? `Taranmış belgeleri ve metin içermeyen sayfaları aşağıdaki <b>Yapay zekâ ile detaylı özet</b> görsel olarak okur.` : "") : "";
+          })()}
           <div class="summary-box" style="margin-top:10px"><b>Genel özet</b>${esc(s.genel)}</div>
           ${s.flags.length ? `<ul class="flag-list">${s.flags.map((x) => `<li class="${x.level}">${esc(x.text)}</li>`).join("")}</ul>` : ""}
           <div class="proje-grid">
@@ -1044,6 +1091,14 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
              <form class="kw-add" data-pform="key"><input type="hidden" name="prov" value="${pv}"><input class="input" name="key" type="password" autocomplete="off" placeholder="${P.keyHint}" style="flex:1"><button class="btn primary" type="submit">Kaydet</button></form>`}
           ${st.aiErr ? `<p class="small" style="color:var(--urgent);margin:8px 0 0">${esc(st.aiErr)}</p>` : ""}
           ${ai ? `
+            ${(() => {
+              const rows = [...(ai.skipped || []).map((x) => { const i = x.indexOf(" — "); return i > 0 ? [x.slice(0, i), x.slice(i + 3)] : ["", x]; }),
+                ...(ai.okunamayan_kisimlar || []).map((x) => ["", x])];
+              const changed = st.rec.files.some((f) => !(ai.fileIds || []).includes(f.id)) && ai.fileIds;
+              return (rows.length ? unreadBox("Okunamayan veya okunmasından emin olunamayan kısımlar", rows, "Bu kısımlardaki bilgiler özete yansımamış olabilir; ilgili sayfaları dokümandan kontrol et.") :
+                `<p class="small ok-line">✓ Gönderilen dokümanların tamamı okundu${ai.visual ? ` (${ai.visual} taranmış belge görsel olarak okundu)` : ""}.</p>`) +
+                (changed ? `<p class="small" style="color:var(--week);margin:6px 0 0">Bu özet oluşturulduktan sonra doküman eklendi/çıkarıldı; güncel olması için yeniden oluştur.</p>` : "");
+            })()}
             <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${esc(ai.genel_ozet)}</div>
             <div class="proje-grid">
               <section><h4>Künye</h4><dl class="kv">${Object.entries({ idare: "İdare", isin_adi: "İşin adı", ihale_turu_usulu: "Tür / usul", ihale_tarihi: "İhale tarihi", yer: "Yer", sure: "Süre", sozlesme_turu: "Sözleşme türü", kalem_sayisi: "Kalemler" })
@@ -1059,8 +1114,6 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
               ${L("Açıklama talebi için sorular", ai.sorulacak_sorular)}
               ${L("Eksik veya belirsiz", ai.eksik_veya_belirsiz)}
             </div>
-            ${ai.visual ? `<p class="small" style="margin:10px 0 0">✓ ${ai.visual} taranmış belge görsel olarak okundu.</p>` : ""}
-            ${ai.skipped && ai.skipped.length ? `<p class="small" style="margin:6px 0 0;color:var(--week)">Okunamayan belgeler: ${esc(ai.skipped.join("; "))}</p>` : ""}
             <p class="muted small" style="margin:10px 0 0">${esc(PROVIDERS[ai.provider || "claude"]?.label || "")} · ${esc(ai.model || "")} · ${new Date(ai.at).toLocaleString("tr-TR")}${ai.usage ? ` · ${(ai.usage.input || 0).toLocaleString("tr-TR")} + ${(ai.usage.output || 0).toLocaleString("tr-TR")} token${ai.usage.free ? " (ücretsiz kota)" : ai.usage.costUsd != null ? ` ≈ $${ai.usage.costUsd}` : ""}` : ""}. Yapay zekâ hata yapabilir; kritik bilgileri dokümandan teyit et.</p>` : ""}
         </div>`;
     }
@@ -1172,6 +1225,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
         const status = () => root.querySelector("#aiCard .ai-status");
         try {
           st.rec.ai = await runAi(ctx, st.rec, st.mem, (m) => { const s = status(); if (s) s.textContent = m; });
+          st.rec.ai.fileIds = st.rec.files.map((f) => f.id);   // sonradan doküman değişirse "yeniden oluştur" uyarısı için
           await saveRecord(ctx, st.rec);
           ctx.toast && ctx.toast("Yapay zekâ özeti hazır");
         } catch (err) {

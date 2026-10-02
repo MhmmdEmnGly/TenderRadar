@@ -200,7 +200,19 @@
     // ---- 9. Eksik / belirsiz
     const missingTypes = (s.missing || []).map((m) => TYPE_LONG[m] || m);
     const eksik = [...(ai.eksik_veya_belirsiz || []).map(tidy).filter(useful), ...(missingTypes.length ? [`İncelenmeyen doküman: ${missingTypes.join(", ")}.`] : [])];
-    if (eksik.length) { children.push(H1(++n, "Eksik veya Belirsiz Bilgiler")); children.push(...bullets(eksik)); }
+    // Okunamayan kısımlar: özet dokümanların tamamını kapsıyorsa onun bildirdikleri, aksi halde doküman taramasının bulguları
+    const aiCovers = ai.at && Array.isArray(ai.fileIds) && (rec.files || []).every((x) => ai.fileIds.includes(x.id));
+    const unread = (aiCovers ? [...(ai.skipped || []), ...(ai.okunamayan_kisimlar || [])] : (s.unread || []).map((u) => `${u.name} — ${u.text}`))
+      .map((x) => tidy(String(x).replace(/\s—\s/, ": "))).filter(useful);
+    if (eksik.length || unread.length) {
+      children.push(H1(++n, "Eksik veya Belirsiz Bilgiler"));
+      if (eksik.length) children.push(...bullets(eksik));
+      if (unread.length) {
+        children.push(H2("Okunamayan kısımlar"));
+        children.push(text("Aşağıdaki kısımlar okunamadığı için bu raporda yer almayabilir; ilgili sayfalar dokümanın aslından kontrol edilmelidir.", { size: 19, color: C.grey }));
+        children.push(...bullets(unread));
+      }
+    }
 
     // ---- Ek: incelenen dokümanlar
     children.push(H1("", "Ek — İncelenen Dokümanlar"));

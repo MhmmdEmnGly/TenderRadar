@@ -420,3 +420,9 @@ body.gated .app { visibility: hidden; }
 .report-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; padding: 14px 18px;
   border-radius: 12px; background: var(--accent-soft); border: 1px solid var(--accent); }
 @media print { .report-bar { display: none !important; } }
+.unread-box { margin-top: 12px; padding: 12px 14px; border-radius: 10px; background: var(--week-soft); border: 1px solid var(--week); font-size: 13px; }
+.unread-box b { color: var(--week); display: block; margin-bottom: 4px; }
+.unread-box ul { margin: 0; padding-left: 18px; line-height: 1.6; }
+.unread-box p { margin: 6px 0 0; color: var(--text-2); }
+.unread-file { font-weight: 600; }
+.ok-line { margin: 12px 0 0; color: var(--later); }

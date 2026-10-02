@@ -198,7 +198,7 @@
       ["Geçici teminat", f.gecici ? `Teklif bedelinin ${f.gecici.v} oranında` : "", f.gecici?.src], ["Kesin teminat", f.kesin ? `İhale bedelinin ${f.kesin.v} oranında` : "", f.kesin?.src],
       ["Fiyat farkı", f.fiyatFarki?.v, f.fiyatFarki?.src], ["Avans", f.avans?.v, f.avans?.src],
       ["Yerli istekli avantajı", f.yerli?.v, f.yerli?.src], ["Sınır değer katsayısı (N)", f.sinir?.v, f.sinir?.src],
-      ["Teklif geçerlilik süresi", f.gecerlilik?.v, f.gecerlilik?.src], ["Gecikme cezası", f.ceza?.v, f.ceza?.src], ["Alt yüklenici", f.altYuk?.v, f.altYuk?.src]
+      ["Ödeme şartları", f.odeme?.v || (useful(ai.odeme_sartlari) ? ai.odeme_sartlari : ""), f.odeme?.src], ["Teklif geçerlilik süresi", f.gecerlilik?.v, f.gecerlilik?.src], ["Gecikme cezası", f.ceza?.v, f.ceza?.src], ["Alt yüklenici", f.altYuk?.v, f.altYuk?.src]
     ]));
     const mali = (ai.yeterlik_ve_mali_sartlar || []).map(tidy).filter(useful);
     if (mali.length) { children.push(H2("Diğer hususlar")); children.push(...bullets(mali)); }

@@ -18,7 +18,7 @@
   };
   const BUCKET = "ihale-dokuman";
   const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
-  const SUMMARY_V = 3;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
+  const SUMMARY_V = 4;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
   const MAX_UPLOAD = 50 * 1024 * 1024;
   // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
   const PROVIDERS = {
@@ -460,6 +460,11 @@
       R(String.raw`((?:binde|yüzde|%)\s*[\d,]+(?:\s*\([^)]{0,20}\))?)[^.\f]{0,140}?gecikme cezası`)]));
 
     // Sözleşme ve teknik şartnameden
+    // Ödeme şartları: hakediş/ödeme süresi içeren cümle ya da "Ödeme yeri ve şartları" maddesi
+    put("odeme", find(docs, ["sozlesme", "idari", "teknik", "diger"], [
+      R(String.raw`([^.\f]{0,160}(?:[Öö]deme|[Hh]akediş)[^.\f]{0,240}?\d{1,3}\s*(?:\([^)]{0,20}\)\s*)?(?:takvim\s+|iş\s+)?gün[^.\f]{0,140})`),
+      R(String.raw`[Öö]deme yeri ve şartları\s*[:\-]?\s*(?:\d{1,2}(?:\.\d{1,2}){0,2}\.?\s*)?(.{20,380}?)(?=\s+\d{1,2}\.\d{1,2}\.?\s|\s+Madde\s+\d|\f|$)`),
+      R(String.raw`([^.\f]{0,120}(?:[Öö]deme|[Hh]akediş)[^.\f]{0,200}?(?:kabul|teslim|fatura|peşin|taksit|aylık)[^.\f]{0,140})`)]), (v) => clean(dropFragment(v)));
     put("teslimSure", find(docs, CONTRACT, [R(String.raw`(?:[Tt]eslim|[İi]şin|[Ss]özleşmenin)\s+süresi[^.\d\f]{0,80}?(\d{1,4}\s*(?:\([^)]{0,25}\)\s*)?(?:takvim günü|iş günü|gün|ay|yıl))`)]));
     put("garanti", find(docs, TECH, [
       R(String.raw`[Gg]aranti süresi[^.\d\f]{0,80}?(\d{1,2}\s*(?:\([^)\d]{0,15}\)\s*)?(?:yıl|ay|sene))`),
@@ -822,7 +827,7 @@
   const A = (d) => ({ type: "array", items: { type: "string" }, description: d });
   const AI_SCHEMA = {
     type: "object", additionalProperties: false,
-    required: ["genel_ozet", "kunye", "kapsam", "ana_kalemler", "teknik_gereksinimler", "yeterlik_ve_mali_sartlar", "riskler", "sorulacak_sorular", "eksik_veya_belirsiz", "okunamayan_kisimlar"],
+    required: ["genel_ozet", "kunye", "kapsam", "ana_kalemler", "teknik_gereksinimler", "yeterlik_ve_mali_sartlar", "odeme_sartlari", "proje_suresi", "riskler", "sorulacak_sorular", "eksik_veya_belirsiz", "okunamayan_kisimlar"],
     properties: {
       genel_ozet: S("Projenin 5-8 cümlelik genel özeti: ne alınıyor/yapılıyor, nerede, ne zaman, ölçeği ve öne çıkan özellikleri"),
       kunye: {
@@ -840,7 +845,9 @@
       },
       teknik_gereksinimler: A("Teklifi doğrudan etkileyen teknik gereksinimler (protokoller, standartlar, donanım/yazılım, test, eğitim, garanti)"),
       yeterlik_ve_mali_sartlar: A("İş deneyimi, benzer iş, teminatlar, fiyat farkı, avans, ceza, ödeme şartları"),
-      riskler: A("Teklif veren firma açısından riskler ve dikkat edilmesi gerekenler"),
+      odeme_sartlari: S("Ödeme şartları tek paragrafta: ödeme şekli (hakediş/kabul sonrası/peşin), hakediş periyodu, ödemenin kaç gün içinde yapılacağı, avans, kesintiler. Yoksa 'Belirtilmemiş'"),
+      proje_suresi: S("İşin süresi, teslim süresi ve önemli ara terminler (ör. 'İşe başlamadan itibaren 180 takvim günü; malzeme teslimi 90 gün'). Yoksa 'Belirtilmemiş'"),
+      riskler: A("Teklif veren firma açısından riskler, önem sırasına göre (en kritik önce): süre/termin, ödeme ve nakit akışı, cezalar, teknik uyum, yeterlik, sözleşme yükümlülükleri. Her madde tam ve anlaşılır tek cümle"),
       sorulacak_sorular: A("İdareye açıklama talebi olarak sorulabilecek belirsizlikler"),
       eksik_veya_belirsiz: A("Dokümanlarda bulunamayan veya çelişkili bilgiler"),
       okunamayan_kisimlar: A("Okuyamadığın ya da emin olamadığın kısımlar: bulanık, kesik, düşük çözünürlüklü, el yazısı, kaşe/imza altında kalan veya boş görünen sayfa/bölümler. Her madde için doküman adı ve sayfa/bölüm belirt. Her şey okunduysa boş liste.")
@@ -895,7 +902,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     return {
       genel_ozet: String(o.genel_ozet || ""), kunye: o.kunye && typeof o.kunye === "object" ? o.kunye : {},
       kapsam: arr(o.kapsam), ana_kalemler: arr(o.ana_kalemler).filter((x) => typeof x === "object").map((x) => ({ ...x, ad: tidyItemName(x.ad) })), teknik_gereksinimler: arr(o.teknik_gereksinimler),
-      yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz), okunamayan_kisimlar: arr(o.okunamayan_kisimlar)
+      yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz), okunamayan_kisimlar: arr(o.okunamayan_kisimlar), odeme_sartlari: String(o.odeme_sartlari || ""), proje_suresi: String(o.proje_suresi || "")
     };
   }
   function parseJsonLoose(txt) {
@@ -1210,6 +1217,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
               ${kvRow("Yerli avantajı", f.yerli)}
               ${kvRow("Sınır değer (N)", f.sinir)}
               ${kvRow("Teklif geçerliliği", f.gecerlilik)}
+              ${kvRow("Ödeme şartları", f.odeme)}
               ${kvRow("Gecikme cezası", f.ceza)}
               ${kvRow("Alt yüklenici", f.altYuk)}
             </dl>${["deneyim", "gecici", "fiyatFarki", "benzerIs"].some((k) => f[k]) ? "" : `<p class="muted small">İdari şartname yüklenmediği ya da okunamadığı için bu alanlar boş.</p>`}</section>
@@ -1280,7 +1288,9 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
             <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${citeHtml(ai.genel_ozet)}</div>
             <div class="proje-grid">
               <section><h4>Künye</h4><dl class="kv">${Object.entries({ idare: "İdare", isin_adi: "İşin adı", ihale_turu_usulu: "Tür / usul", ihale_tarihi: "İhale tarihi", yer: "Yer", sure: "Süre", sozlesme_turu: "Sözleşme türü", kalem_sayisi: "Kalemler" })
-                .map(([k, l]) => ai.kunye && ai.kunye[k] ? `<dt>${l}</dt><dd>${citeHtml(ai.kunye[k])}</dd>` : "").join("")}</dl></section>
+                .map(([k, l]) => ai.kunye && ai.kunye[k] ? `<dt>${l}</dt><dd>${citeHtml(ai.kunye[k])}</dd>` : "").join("")}
+                ${ai.proje_suresi && !/^belirtilmemiş/i.test(ai.proje_suresi) ? `<dt>Proje süresi</dt><dd>${citeHtml(ai.proje_suresi)}</dd>` : ""}
+                ${ai.odeme_sartlari && !/^belirtilmemiş/i.test(ai.odeme_sartlari) ? `<dt>Ödeme şartları</dt><dd>${citeHtml(ai.odeme_sartlari)}</dd>` : ""}</dl></section>
               ${L("Kapsam", ai.kapsam)}
             </div>
             ${ai.ana_kalemler && ai.ana_kalemler.length ? `<section style="margin-top:12px"><h4>Ana kalemler</h4><div class="table-wrap"><table class="table small"><thead><tr><th>Kalem</th><th style="text-align:right">Miktar</th><th>Birim</th></tr></thead><tbody>

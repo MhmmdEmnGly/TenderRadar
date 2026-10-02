@@ -21,15 +21,17 @@
   const MAX_UPLOAD = 50 * 1024 * 1024;
   // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
   const PROVIDERS = {
-    gemini: { label: "Gemini", note: "ücretsiz kota", keyStore: "tr.geminiKey", keyOk: (k) => /^[\w-]{30,}$/.test(k), keyHint: "AIza…",
+    gemini: { label: "Gemini", note: "ücretsiz kota", keyStore: "tr.geminiKey", keyOk: (k) => /^[\w.-]{30,}$/.test(k), keyHint: "AIza… ya da AQ.…",
       keyUrl: "https://aistudio.google.com/apikey", keySite: "aistudio.google.com" },
     claude: { label: "Claude", note: "ücretli", keyStore: "tr.anthropicKey", keyOk: (k) => /^sk-ant-/.test(k), keyHint: "sk-ant-…",
       keyUrl: "https://console.anthropic.com/settings/keys", keySite: "console.anthropic.com" }
   };
   const PROV_STORE = "tr.aiProvider";
   const CLAUDE_MODEL = "claude-opus-5-5";
-  const GEMINI_MODELS = [["gemini-3.8-flash", "Gemini 3.8 Flash (önerilen)"], ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (daha yüksek kota)"], ["gemini-flash-latest", "En güncel Flash"]];
-  const GEMINI_FALLBACK = "gemini-3.5-flash-lite";
+  const GEMINI_MODELS = [["gemini-3.7-flash", "Gemini 3.7 Flash (önerilen)"], ["gemini-3.8-flash", "Gemini 3.8 Flash (en yeni, yoğun olabilir)"],
+    ["gemini-3.5-flash", "Gemini 3.5 Flash"], ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (en yüksek kota)"]];
+  // Seçili model yoğunsa (503), kotası dolduysa (429) ya da kaldırıldıysa (404) sırayla denenecek modeller
+  const GEMINI_CHAIN = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
   const GMODEL_STORE = "tr.geminiModel";
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
   const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* depolama kapalı */ } };
@@ -746,13 +748,15 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
       }
       return j;
     }
-    let used = model, j;
-    try { j = await call(model); }
-    catch (e) {
-      // Kota dolduysa ya da model adı değiştiyse daha yüksek kotalı Flash-Lite ile bir kez daha dene
-      if ((e.status === 429 || e.status === 404) && model !== GEMINI_FALLBACK) { used = GEMINI_FALLBACK; j = await call(GEMINI_FALLBACK); }
-      else throw e;
+    let used = null, j = null, lastErr = null;
+    for (const m of [...new Set([model, ...GEMINI_CHAIN])]) {
+      try { j = await call(m); used = m; break; }
+      catch (e) {
+        lastErr = e;
+        if (!(e.status === 429 || e.status === 404 || e.status === 500 || e.status === 503)) throw e;   // anahtar/istek hatası: diğer modeller de aynı sonucu verir
+      }
     }
+    if (!j) throw lastErr;
     const cand = j.candidates && j.candidates[0];
     if (!cand) throw new Error("Gemini yanıt vermedi" + (j.promptFeedback && j.promptFeedback.blockReason ? ` (engellendi: ${j.promptFeedback.blockReason})` : ""));
     if (cand.finishReason === "MAX_TOKENS") throw new Error("Yanıt uzunluk sınırına takıldı; tekrar dene");
@@ -806,7 +810,7 @@ Kısa ve net yaz; maddeler tek cümle olsun.`;
       if (/location is not supported|not available in your country/i.test(m)) return "Gemini API bulunduğun bölgede ücretsiz olarak sunulmuyor.";
       if (s === 403) return "Bu anahtarın Gemini API'ye erişim izni yok (Google AI Studio'da anahtarın projesini kontrol et).";
       if (s === 404) return "Seçili Gemini modeli bulunamadı; listeden başka bir model seçip tekrar dene.";
-      if (s >= 500) return "Google tarafında geçici bir sorun var; biraz sonra tekrar dene.";
+      if (s >= 500) return "Gemini modellerinin hepsi şu an yoğun ya da Google tarafında geçici bir sorun var; birkaç dakika sonra tekrar dene.";
       if (/Failed to fetch|NetworkError/i.test(m)) return "Google'a bağlanılamadı; internet bağlantını kontrol et.";
       return "Gemini özeti oluşturulamadı: " + m;
     }

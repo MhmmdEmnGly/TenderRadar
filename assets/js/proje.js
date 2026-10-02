@@ -1067,6 +1067,9 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     return `<span class="src-chip" title="${esc(src.name)}${src.page ? " · sayfa " + src.page : ""}">${short}${src.page ? " s." + src.page : ""}</span>`;
   }
   const kvRow = (label, f, fallback) => (f || fallback) ? `<dt>${label}</dt><dd>${f ? esc(f.v) + " " + srcChip(f.src) : `<span class="muted">${esc(fallback)}</span>`}</dd>` : "";
+  // Metin içindeki doküman atıflarını, ör. "(Özel Teknik Ş. md. 1.9)", "(İdari Şartname, s. 4)", hafif renkle ayır
+  const RX_CITE = /\((?=[^()]{2,140}\))[^()]*?(?:Ş\.|[Şş]artname|[Ss]özleşme|[Cc]etvel|İlan|[Zz]eyilname|[Tt]asar|\bmd\.|[Mm]adde|\bs\.\s?\d|[Ss]ayfa|\bEk[- ]?\d|[Kk]alem\s?\d)[^()]*\)/g;
+  const citeHtml = (s) => esc(s).replace(RX_CITE, (m) => `<span class="cite">${m}</span>`);
   // Okunamayan kısımlar uyarı kutusu: rows = [[dosya adı, açıklama], …]
   function unreadBox(title, rows, note) {
     return `<div class="unread-box" role="alert"><b>⚠ ${esc(title)}</b>
@@ -1209,7 +1212,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
       const estIn = Math.round(chars / 3);
       const estCost = (estIn * 4 + 6000 * 20) / 1e6;
       const gModel = lsGet(GMODEL_STORE) || GEMINI_MODELS[0][0];
-      const L = (title, arr) => arr && arr.length ? `<section><h4>${title}</h4><ul class="small">${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : "";
+      const L = (title, arr) => arr && arr.length ? `<section><h4>${title}</h4><ul class="small">${arr.map((x) => `<li>${citeHtml(x)}</li>`).join("")}</ul></section>` : "";
       const info = pv === "gemini"
         ? `Tüm dokümanlar birlikte okunur (≈ ${estIn.toLocaleString("tr-TR")} token) — Google'ın <b>ücretsiz kotasıyla</b> çalışır. Taranmış PDF'ler görsel olarak okunur.
            <br><span class="muted">Ücretsiz katmanda Google gönderilen içeriği ürünlerini geliştirmek için kullanabilir; bu yüzden yalnızca ihale dokümanları gönderilir — notların, fiyatların ve müşteri kartların gönderilmez.</span>`
@@ -1240,10 +1243,10 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
                 `<p class="small ok-line">✓ Gönderilen dokümanların tamamı okundu${ai.visual ? ` (${ai.visual} taranmış belge görsel olarak okundu)` : ""}.</p>`) +
                 (changed ? `<p class="small" style="color:var(--week);margin:6px 0 0">Bu özet oluşturulduktan sonra doküman eklendi/çıkarıldı; güncel olması için yeniden oluştur.</p>` : "");
             })()}
-            <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${esc(ai.genel_ozet)}</div>
+            <div class="summary-box" style="margin-top:12px"><b>Genel özet</b>${citeHtml(ai.genel_ozet)}</div>
             <div class="proje-grid">
               <section><h4>Künye</h4><dl class="kv">${Object.entries({ idare: "İdare", isin_adi: "İşin adı", ihale_turu_usulu: "Tür / usul", ihale_tarihi: "İhale tarihi", yer: "Yer", sure: "Süre", sozlesme_turu: "Sözleşme türü", kalem_sayisi: "Kalemler" })
-                .map(([k, l]) => ai.kunye && ai.kunye[k] ? `<dt>${l}</dt><dd>${esc(ai.kunye[k])}</dd>` : "").join("")}</dl></section>
+                .map(([k, l]) => ai.kunye && ai.kunye[k] ? `<dt>${l}</dt><dd>${citeHtml(ai.kunye[k])}</dd>` : "").join("")}</dl></section>
               ${L("Kapsam", ai.kapsam)}
             </div>
             ${ai.ana_kalemler && ai.ana_kalemler.length ? `<section style="margin-top:12px"><h4>Ana kalemler</h4><div class="table-wrap"><table class="table small"><thead><tr><th>Kalem</th><th style="text-align:right">Miktar</th><th>Birim</th></tr></thead><tbody>

@@ -9,7 +9,9 @@
   const DOCX_URL = "https://cdn.jsdelivr.net/npm/docx@9.8.1/+esm";
   const AUTHOR = "Muhammet Emin Gülay";
   // Sade kurumsal palet: lacivert vurgu, koyu gri metin, nötr gri çizgiler/zeminler
-  const C = { navy: "1F3864", ink: "262626", text: "333333", grey: "6B6B6B", line: "BFBFBF", hair: "D9D9D9", fill: "F2F2F2", zebra: "FAFAFA", white: "FFFFFF" };
+  const C = { navy: "1F3864", ink: "262626", text: "333333", grey: "6B6B6B", line: "BFBFBF", hair: "D9D9D9", fill: "F2F2F2", zebra: "FAFAFA", white: "FFFFFF", cite: "2F5496" };
+  // Doküman atıfları: "(Özel Teknik Ş. md. 1.9)", "(İdari Şartname, s. 4)" vb.
+  const RX_CITE = /\((?=[^()]{2,140}\))[^()]*?(?:Ş\.|[Şş]artname|[Ss]özleşme|[Cc]etvel|İlan|[Zz]eyilname|[Tt]asar|\bmd\.|[Mm]adde|\bs\.\s?\d|[Ss]ayfa|\bEk[- ]?\d|[Kk]alem\s?\d)[^()]*\)/g;
   const FONT = "Calibri";
   const PAGE_W = 11906, MARGIN = 1134, CONTENT_W = PAGE_W - 2 * MARGIN;   // A4, 2 cm kenar boşluğu
   const TYPE_SHORT = { idari: "İdari Şartname", teknik: "Teknik Şartname", cetvel: "Birim Fiyat Cetveli", sozlesme: "Sözleşme Tasarısı", ilan: "İhale İlanı", zeyil: "Zeyilname", form: "Standart Form", diger: "Doküman" };
@@ -41,13 +43,25 @@
     const para = (children, o = {}) => new Paragraph({ children: Array.isArray(children) ? children : [children], spacing: { before: o.before ?? 0, after: o.after ?? 100, line: o.line ?? 276 },
       alignment: o.align, keepNext: o.keepNext, keepLines: o.keepLines, border: o.border, indent: o.indent });
     const text = (t2, o = {}) => para(run(t2, o), o);
-    const cite = (src) => (src ? [run(`  (${srcText(src)})`, { size: 16, color: C.grey })] : []);
+    const cite = (src) => (src ? [run(`  (${srcText(src)})`, { size: 17, color: C.cite })] : []);
+    // Metin içindeki "(Teknik Ş. md. 4.2)" gibi atıfları ayrı renkte koşu olarak yaz
+    const citeRuns = (str, o = {}) => {
+      const s2 = String(str ?? ""), out = [];
+      let last = 0;
+      for (const m of s2.matchAll(RX_CITE)) {
+        if (m.index > last) out.push(run(s2.slice(last, m.index), o));
+        out.push(run(m[0], { ...o, size: (o.size || 21) - 2, color: C.cite }));
+        last = m.index + m[0].length;
+      }
+      if (last < s2.length) out.push(run(s2.slice(last), o));
+      return out.length ? out : [run("", o)];
+    };
     const H1 = (no, title) => new Paragraph({ heading: HeadingLevel.HEADING_1, keepNext: true, spacing: { before: 360, after: 140 },
       border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: C.navy, space: 4 } },
       children: [run(no ? `${no}.  ` : "", { bold: true, size: 24, color: C.navy }), run(title, { bold: true, size: 24, color: C.navy, caps: true, spacing: 10 })] });
     const H2 = (title) => new Paragraph({ heading: HeadingLevel.HEADING_2, keepNext: true, spacing: { before: 200, after: 80 }, children: [run(title, { bold: true, size: 21, color: C.ink })] });
     const bullets = (arr, ref = "dot") => (arr || []).filter((x) => (Array.isArray(x) ? x.length : useful(x))).map((x) => new Paragraph({
-      numbering: { reference: ref, level: 0 }, spacing: { after: 70, line: 268 }, children: Array.isArray(x) ? x : [run(x)] }));
+      numbering: { reference: ref, level: 0 }, spacing: { after: 70, line: 268 }, children: Array.isArray(x) ? x : citeRuns(x) }));
     const none = (msg) => text(msg, { italics: true, color: C.grey, size: 20 });
     const B = (color = C.hair, size = 4) => ({ style: BorderStyle.SINGLE, size, color });
     const NONE = { style: BorderStyle.NONE, size: 0, color: C.white };
@@ -64,7 +78,7 @@
     const kvTable = (pairs, emptyMsg) => {
       const rows = pairs.filter((p) => p && useful(p[1])).map(([label, value, src]) => new TableRow({ cantSplit: true, children: [
         cell(run(label, { bold: true, color: C.ink, size: 20 }), LBL, { fill: C.fill, borders: { top: B(), bottom: B(), left: NONE, right: NONE } }),
-        cell([para([run(value, { size: 20 }), ...cite(src)], { after: 0 })], CONTENT_W - LBL, { borders: { top: B(), bottom: B(), left: NONE, right: NONE } })
+        cell([para([...citeRuns(value, { size: 20 }), ...cite(src)], { after: 0 })], CONTENT_W - LBL, { borders: { top: B(), bottom: B(), left: NONE, right: NONE } })
       ] }));
       return rows.length ? [table([LBL, CONTENT_W - LBL], rows), text("", { after: 40 })] : (emptyMsg ? [none(emptyMsg)] : []);
     };
@@ -114,7 +128,7 @@
     let n = 0;
     children.push(H1(++n, "Yönetici Özeti"));
     const lead = tidy(ai.genel_ozet) || tidy(s.genel) || "";
-    children.push(para(run(lead || "Özet için yeterli doküman bilgisi bulunmuyor.", { size: 22, color: C.ink }), { after: 120, line: 312,
+    children.push(para(citeRuns(lead || "Özet için yeterli doküman bilgisi bulunmuyor.", { size: 22, color: C.ink }), { after: 120, line: 312,
       border: { left: { style: BorderStyle.SINGLE, size: 18, color: C.navy, space: 12 } }, indent: { left: 240 } }));
 
     // ---- 2. Künye

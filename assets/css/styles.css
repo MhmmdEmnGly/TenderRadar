@@ -426,3 +426,9 @@ body.gated .app { visibility: hidden; }
 .unread-box p { margin: 6px 0 0; color: var(--text-2); }
 .unread-file { font-weight: 600; }
 .ok-line { margin: 12px 0 0; color: var(--later); }
+/* Doküman atıfları: metinden hafifçe ayrışan, sade vurgu */
+.cite { color: #2f5496; font-weight: 500; white-space: nowrap; }
+:root[data-theme="dark"] .cite { color: #8fb3e8; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .cite { color: #8fb3e8; } }
+.src-chip { color: #2f5496; background: #eaf0f8; }
+:root[data-theme="dark"] .src-chip { color: #8fb3e8; background: #1c2a40; }

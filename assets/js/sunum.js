@@ -31,11 +31,16 @@
   function full(s) {
     let t = String(s || "").replace(RX_CITE, "").replace(/[^.]*yapay zekâ[^.]*\.?/gi, "").replace(/…+\s*$/, "")
       .replace(/^[A-ZÇĞİÖŞÜa-zçğıöşü ]{0,30}?\b\d{1,2}(?:\.\d{1,2}){1,3}\.\s+/u, "")   // "Ödeme yeri 12.1.1. …" gibi madde numarası kalıntısı
-      .replace(/\s+/g, " ").trim().replace(/\s+([.,;:])/g, "$1");
-    t = t.replace(/[,;:\s]+$/, "");
+      .replace(/\s+/g, " ").trim().replace(/\s+([.,;:])/g, "$1")
+      // Noktalama: noktalı virgül yerine nokta (yeni cümle büyük harfle), uzun tire yerine düz tire
+      .replace(/\s*;\s*(\S)/g, (m, c) => ". " + c.toLocaleUpperCase("tr-TR"))
+      .replace(/\s*[—–]\s*/g, " - ");
+    t = t.replace(/[,;:\s-]+$/, "");
     if (t && !/[.!?]$/.test(t)) t += ".";
     return t.charAt(0).toLocaleUpperCase("tr-TR") + t.slice(1);
   }
+  // Sunuma değmeyecek genel/herkesçe bilinen ifadeler (mesai saatleri, genel mevzuat atıfları vb.)
+  const TRIVIAL = /mesai|çalışma saat|hafta ?içi[^.]{0,40}(saat|mesai|\d{1,2}[.:]\d{2})|hafta ?sonu[^.]{0,30}(çalış|saat|mesai)|resmi tatil|\b0?8[.:]30\b|\b17[.:]\d{2}\b|kılık|kıyafet|yemek|servis aracı|kimlik kart|giriş kart|mevzuat(a|ına) uygun|yürürlükteki mevzuat|ilgili mevzuat|genel hükümler|kanun(a|lara) uygun|trafik kural|nezaket|temizliğ|çevre düzen/i;
   // Aynı anlamdaki maddeleri ayıkla (kelime kümesi benzerliği)
   const words = (s) => new Set(fold(s).replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length > 3));
   function similar(a, b) {
@@ -49,7 +54,8 @@
   // ---- Risk sınıflandırma
   // Finansal: para akışını doğrudan etkileyen ifadeler ("birim fiyat cetveli" gibi doküman adları sayılmaz)
   const FIN_WORDS = /teminat|fiyat fark|avans|ceza|ödeme|hakediş|\bkur\b|döviz|maliyet|finans|nakit|sigorta|vergi|damga|kdv|kâr\b|zarar|nakde|bütçe|fiyat artış|enflasyon/i;
-  const DOC_ISSUE = /çelişk|uyumsuz|uyuşma|tutarsız|zıt|farklı ihale|alakasız|belirsiz|okunama|eksik doküman/i;
+  // Doküman sorunu: tutarsızlık/okunamama; "belirsiz" yalnızca doküman/bilgi bağlamında (ör. "ödeme süresi belirsiz" finansaldır)
+  const DOC_ISSUE = /çelişk|uyumsuz|uyuşma|tutarsız|zıt|farklı ihale|alakasız|okunama|eksik doküman|(doküman|şartname|bilgi|metraj|kapsam)[^.]{0,40}belirsiz|belirsiz[^.]{0,30}(doküman|şartname|bilgi|metraj|kapsam)/i;
   const isFin = (s) => { const v = String(s).replace(/birim fiyat (teklif )?cetvel\w*|teklif cetvel\w*/gi, ""); return !DOC_ISSUE.test(v) && FIN_WORDS.test(v); };
   const FIN_LABEL = [[/ödeme|hakediş/i, "Ödeme"], [/teminat/i, "Teminat"], [/fiyat fark|\bkur\b|döviz|fiyat artış|enflasyon/i, "Fiyat / kur riski"], [/avans|nakit|finans/i, "Nakit akışı"],
     [/arıza|müdahale|garanti|kronik|bila ?bedel/i, "Garanti cezası"], [/ceza/i, "Ceza"], [/işçilik|personel|isg|ekip/i, "İşçilik maliyeti"],
@@ -69,7 +75,7 @@
     const all = [];
     const push = (list, label, text) => {
       const v = full(text);
-      if (!useful(v) || v.length < 8) return;
+      if (!useful(v) || v.length < 8 || TRIVIAL.test(v)) return;
       if (all.some((x) => similar(x, v))) return;
       all.push(v); list.push({ label, text: v });
     };
@@ -113,7 +119,7 @@
 
     // ---------- Kapsam: tüm farklı maddeler (tekrarsız)
     const scope = [];
-    const addScope = (x) => { const v = full(x); if (useful(v) && v.length > 12 && !scope.some((y) => similar(y, v))) scope.push(v); };
+    const addScope = (x) => { const v = full(x); if (useful(v) && v.length > 12 && !TRIVIAL.test(v) && !scope.some((y) => similar(y, v))) scope.push(v); };
     (ai.kapsam || []).forEach(addScope);
     if (tech.scope) {
       const parts = tech.scope.v.split(/(?<=[.;])\s+(?=[A-ZÇĞİÖŞÜ0-9])/u);
@@ -125,7 +131,8 @@
     const items = (s.items || []).length ? s.items : (ai.ana_kalemler || []).map((i) => ({ name: i.ad, qty: i.miktar, unit: i.birim }));
     if (items.length) {
       const top = items.slice(0, 6).map((i) => `${tidyName(i.name)} (${typeof i.qty === "number" ? i.qty.toLocaleString("tr-TR") : i.qty}${i.unit ? " " + i.unit : ""})`);
-      scope.push(full(`Ana kalemler: ${top.join("; ")}${items.length > 6 ? ` ve ${items.length - 6} kalem daha` : ""}`));
+      const list = top.length > 1 ? `${top.slice(0, -1).join(", ")} ve ${top[top.length - 1]}` : top[0];
+      scope.push(full(`Ana kalemler: ${list}${items.length > 6 ? `. Bunlara ek olarak ${items.length - 6} kalem daha bulunmaktadır` : ""}`));
     }
 
     // ---------- Temel bilgiler
@@ -206,21 +213,38 @@
     const CPI15 = 11.5, CPI14 = 12.3;
 
     // Risk satırları: her satırın yüksekliği metnine göre; sığmayanlar "(devam)" slaydına
+    // Aynı başlıktaki maddeler tek blokta toplanır: başlık solda bir kez, maddeler sağda alt alta (birden fazlaysa tireyle)
     function riskSlides(title, list, emptyMsg) {
-      const y0 = 1.6, yMax = H - 0.75, textW = W - 2 * M - 2.95;
-      const rowH = (r, sc = 1) => Math.max(0.55 * sc, estLines(r.text, Math.floor(textW * CPI14 / sc)) * 0.245 * sc + 0.26 * sc);
-      const pages = list.length ? paginate(list, (r, sc) => rowH(r, sc), () => yMax - y0) : [{ items: [], scale: 1 }];
+      const y0 = 1.6, yMax = H - 0.75, textW = W - 2 * M - 2.95, avail = yMax - y0;
+      const groups = [];
+      for (const r of list) { let g = groups.find((x) => x.label === r.label); if (!g) groups.push((g = { label: r.label, texts: [] })); g.texts.push(r.text); }
+      const lineW = (multi) => textW - (multi ? 0.3 : 0);
+      const itemH = (txt, sc, multi) => estLines(txt, Math.floor(lineW(multi) * CPI14 / sc)) * 0.245 * sc + (multi ? 0.08 * sc : 0);
+      const groupH = (g, sc = 1) => Math.max(0.55 * sc, g.texts.reduce((a, t2) => a + itemH(t2, sc, g.texts.length > 1), 0) + 0.26 * sc);
+      // Bir slayta sığmayacak kadar uzun grup parçalara bölünür
+      const blocks = [];
+      for (const g of groups) {
+        let cur = { label: g.label, texts: [] };
+        for (const t2 of g.texts) {
+          const trial = { label: g.label, texts: [...cur.texts, t2] };
+          if (cur.texts.length && groupH(trial) > avail) { blocks.push(cur); cur = { label: g.label, texts: [t2], cont: true }; }
+          else cur = { ...cur, texts: trial.texts };
+        }
+        blocks.push(cur);
+      }
+      const pages = blocks.length ? paginate(blocks, (b, sc) => groupH(b, sc), () => avail) : [{ items: [], scale: 1 }];
       pages.forEach((pg, pi) => {
         const sl = pptx.addSlide();
         frame(sl, pi ? `${title} (devam)` : title);
         if (!pg.items.length) { sl.addText(emptyMsg, { x: M, y: y0, w: W - 2 * M, h: 0.5, fontFace: FONT, fontSize: 16, color: C.grey, italic: true }); return; }
         const fs = Math.round(14 * pg.scale * 2) / 2;
         let y = y0;
-        pg.items.forEach((r, i) => {
-          const h = rowH(r, pg.scale);
+        pg.items.forEach((b, i) => {
+          const h = groupH(b, pg.scale), multi = b.texts.length > 1;
           sl.addShape(pptx.ShapeType.rect, { x: M, y: y + 0.1, w: 0.08, h: h - 0.2, fill: { color: C.navy }, line: { color: C.navy, width: 0 } });
-          sl.addText(r.label, { x: M + 0.25, y, w: 2.6, h, fontFace: FONT, fontSize: fs, bold: true, color: C.navy, valign: "middle" });
-          sl.addText(r.text, { x: M + 2.95, y, w: textW, h, fontFace: FONT, fontSize: fs, color: C.text, valign: "middle", margin: 0.05 });
+          sl.addText(b.label, { x: M + 0.25, y, w: 2.6, h, fontFace: FONT, fontSize: fs, bold: true, color: C.navy, valign: multi ? "top" : "middle", margin: [0.13 * 72, 0, 0, 0.05 * 72] });
+          sl.addText(multi ? b.texts.map((x, k) => ({ text: x, options: { bullet: { code: "2013", indent: 14 }, paraSpaceAfter: k < b.texts.length - 1 ? Math.round(6 * pg.scale) : 0, breakLine: true } })) : b.texts[0],
+            { x: M + 2.95, y, w: textW, h, fontFace: FONT, fontSize: fs, color: C.text, valign: multi ? "top" : "middle", margin: multi ? [0.13 * 72, 0.05 * 72, 0, 0.05 * 72] : 0.05 });
           if (i < pg.items.length - 1) sl.addShape(pptx.ShapeType.line, { x: M + 0.25, y: y + h, w: W - 2 * M - 0.25, h: 0, line: { color: C.line, width: 0.5 } });
           y += h;
         });

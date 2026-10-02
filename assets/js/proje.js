@@ -18,7 +18,7 @@
   };
   const BUCKET = "ihale-dokuman";
   const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
-  const SUMMARY_V = 4;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
+  const SUMMARY_V = 5;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
   const MAX_UPLOAD = 50 * 1024 * 1024;
   // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
   const PROVIDERS = {
@@ -509,7 +509,7 @@
     let first = true;
     s = s.replace(rxNext, (m, off, all) => {
       const before = all.slice(0, off);
-      if (first && !new RegExp(`${PARAM_KEYS}: `).test(before)) { first = false; return /[—–-]\s*$/.test(before) ? " " : " — "; }
+      if (first && !new RegExp(`${PARAM_KEYS}: `).test(before)) { first = false; return /[—–,-]\s*$/.test(before) ? " " : ", "; }
       first = false;
       return /[,;]\s*$/.test(before) ? " " : ", ";
     });

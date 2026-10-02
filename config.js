@@ -11,5 +11,5 @@ window.TR_CONFIG = {
   // Supabase'de kullanıcıyı bu biçimde oluştur (SETUP.md). Tam e-posta ile de giriş yapılabilir.
   usernameDomain: "tenderradar.app",
   // Panel dosyalarının sürümü: değiştirilince tarayıcılar app.js / proje.js dosyalarını yeniden indirir
-  version: "2026-10-02.2"
+  version: "2026-10-02.3"
 };

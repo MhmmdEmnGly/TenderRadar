@@ -18,7 +18,7 @@
   };
   const BUCKET = "ihale-dokuman";
   const MAX_TEXT = 400000;          // belge başına saklanan metin (karakter)
-  const SUMMARY_V = 2;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
+  const SUMMARY_V = 3;              // okuyucu/çıkarım değişince artırılır; eski özetler açılışta yeniden hesaplanır
   const MAX_UPLOAD = 50 * 1024 * 1024;
   // Yapay zekâ sağlayıcıları: anahtarlar yalnızca bu tarayıcıda (localStorage) saklanır, veritabanına yazılmaz
   const PROVIDERS = {
@@ -480,10 +480,40 @@
   const UNIT = String.raw`(?:adet|ad\.?|takım|tk\.?|set|metre|mt\.?|m|m²|m2|m³|m3|mtül|kg|ton|lt\.?|litre|paket|lisans|kalem|hizmet|ay|gün|saat|km|kişi|adam\/ay|adam\/gün|adam-ay|götürü|gtr\.?|sistem|proje|parti|rulo|kutu|çift|koli|boy|nokta|istasyon|yıl|kVA|kW)`;
   const RX_A = new RegExp(String.raw`^\s*([A-Z]?\d{1,4}(?:[.\-]\d{1,3}){0,2})[.)]?\s+(.{3,240}?)\s+(${UNIT})\s+(\d[\d.,]*)(?=\s|$)`, "iu");
   const RX_B = new RegExp(String.raw`^\s*([A-Z]?\d{1,4})[.)]?\s+(.{3,240}?)\s+(\d[\d.,]*)\s+(${UNIT})(?=\s|$)`, "iu");
+  // Kalem adlarındaki teknik ifadeleri düzgün yaz: Türkçe karakter kümesinde olmadığı için "?" olarak kaydedilmiş
+  // sembolleri geri getir (η, φ, °, ³, ², ×), birimleri standartlaştır (kW, kVA), parametreleri "Q: 119 m³/h, Hm: 100 mSS" biçiminde ayır.
+  const PARAM_KEYS = String.raw`(?:Q|Hm|H|P|N|U|I|n|Sistem verimi \(η\)|Pompa verimi \(η\)|Motor verimi \(η\)|Toplam verim \(η\)|Hidrolik verim \(η\)|Verim|cos φ|Debi|Basma yüksekliği|Güç|Gerilim|Akım|Devir|Çap|DN|PN|IP)`;
+  function tidyItemName(name) {
+    let s = String(name || "").replace(/�/g, "?").replace(/\s+/g, " ").trim();
+    if (!s) return s;
+    const VERIM = { sistem: "Sistem verimi", pompa: "Pompa verimi", motor: "Motor verimi", toplam: "Toplam verim", hidrolik: "Hidrolik verim" };
+    s = s.replace(/(^|[\s(,;/])(?:\?|η|n|ɳ)\s?(sistem|pompa|motor|toplam|hidrolik)\b/gi, (m, p, w) => `${p}${VERIM[w.toLocaleLowerCase("tr-TR")]} (η)`)
+      .replace(/(^|[\s(,;/])\?\s?(verim)\b/gi, "$1Verim (η)")
+      .replace(/\bcos\s?[?ϕ]/gi, "cos φ")
+      .replace(/(\d)\s?\?\s?C\b/g, "$1 °C").replace(/(\d)\s?º\s?C\b/g, "$1 °C")
+      .replace(/\bm\s?[?3]\s?\/\s?(h|sa|saat|s|sn|gün)\b/gi, (m, u) => `m³/${u.toLowerCase()}`)
+      .replace(/\b(l|lt)\s?\/\s?(s|sn)\b/gi, "l/s")
+      .replace(/(\d)\s?\?\s?(\d)/g, "$1×$2")
+      .replace(/(\d+(?:[.,]\d+)?)\s?(kw|KW|Kw)\b/g, "$1 kW").replace(/(\d+(?:[.,]\d+)?)\s?(kva|KVA|Kva)\b/g, "$1 kVA").replace(/(\d+(?:[.,]\d+)?)\s?(kwh|KWH|Kwh|KWh)\b/g, "$1 kWh")
+      .replace(/(\d+(?:[.,]\d+)?)\s?(mss|MSS|mSs|mSS)\b/g, "$1 mSS")
+      .replace(/%\s?(\d+)[.,]0+\b/g, "%$1").replace(/%\s?(\d+)[.,](\d*[1-9])0*\b/g, "%$1,$2");
+    // Parametreler: "Q:119" → "Q: 119"; ardışık parametreler virgülle; ilk parametreden önce ayraç
+    const rxKey = new RegExp(`(^|[\\s,;])(${PARAM_KEYS})\\s*[:=]\\s*`, "g");
+    s = s.replace(rxKey, (m, p, k) => `${p}${k}: `);
+    const rxNext = new RegExp(`\\s+(?=${PARAM_KEYS}: )`, "g");
+    let first = true;
+    s = s.replace(rxNext, (m, off, all) => {
+      const before = all.slice(0, off);
+      if (first && !new RegExp(`${PARAM_KEYS}: `).test(before)) { first = false; return /[—–-]\s*$/.test(before) ? " " : " — "; }
+      first = false;
+      return /[,;]\s*$/.test(before) ? " " : ", ";
+    });
+    return s.replace(/\s+,/g, ",").replace(/\s{2,}/g, " ").trim();
+  }
   function parseItems(docs) {
     const items = [], seen = new Set();
     const add = (it, d, page) => {
-      it.name = clean(it.name).replace(/^\|\s*|\s*\|$/g, "");
+      it.name = tidyItemName(clean(it.name).replace(/^\|\s*|\s*\|$/g, ""));
       if (!it.name || !/\p{L}{3}/u.test(it.name) || !(it.qty > 0) || /^(sıra|toplam|genel toplam|ara toplam|kdv)/i.test(it.name) || /\s[x×]$/i.test(it.name)) return;
       const k = fold(it.no + "|" + it.name + "|" + it.qty);
       if (seen.has(k)) return;
@@ -864,7 +894,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     const arr = (v) => (Array.isArray(v) ? v.filter((x) => x != null && x !== "") : []);
     return {
       genel_ozet: String(o.genel_ozet || ""), kunye: o.kunye && typeof o.kunye === "object" ? o.kunye : {},
-      kapsam: arr(o.kapsam), ana_kalemler: arr(o.ana_kalemler).filter((x) => typeof x === "object"), teknik_gereksinimler: arr(o.teknik_gereksinimler),
+      kapsam: arr(o.kapsam), ana_kalemler: arr(o.ana_kalemler).filter((x) => typeof x === "object").map((x) => ({ ...x, ad: tidyItemName(x.ad) })), teknik_gereksinimler: arr(o.teknik_gereksinimler),
       yeterlik_ve_mali_sartlar: arr(o.yeterlik_ve_mali_sartlar), riskler: arr(o.riskler), sorulacak_sorular: arr(o.sorulacak_sorular), eksik_veya_belirsiz: arr(o.eksik_veya_belirsiz), okunamayan_kisimlar: arr(o.okunamayan_kisimlar)
     };
   }
@@ -1250,7 +1280,7 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
               ${L("Kapsam", ai.kapsam)}
             </div>
             ${ai.ana_kalemler && ai.ana_kalemler.length ? `<section style="margin-top:12px"><h4>Ana kalemler</h4><div class="table-wrap"><table class="table small"><thead><tr><th>Kalem</th><th style="text-align:right">Miktar</th><th>Birim</th></tr></thead><tbody>
-              ${ai.ana_kalemler.map((i) => `<tr><td>${esc(i.ad)}</td><td style="text-align:right">${esc(i.miktar)}</td><td>${esc(i.birim)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+              ${ai.ana_kalemler.map((i) => `<tr><td>${citeHtml(tidyItemName(i.ad))}</td><td style="text-align:right">${esc(i.miktar)}</td><td>${esc(i.birim)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
             <div class="proje-grid" style="margin-top:12px">
               ${L("Teknik gereksinimler", ai.teknik_gereksinimler)}
               ${L("Yeterlik ve mali şartlar", ai.yeterlik_ve_mali_sartlar)}
@@ -1429,5 +1459,5 @@ Taranmış sayfaları da dikkatle oku; okuyamadığın ya da okumasından emin o
     return { isBusy: () => !!st.busy };
   }
 
-  window.TR_PROJE = { mount, core: { extractFiles, buildSummary, classify, repairText, TYPES } };
+  window.TR_PROJE = { mount, core: { extractFiles, buildSummary, classify, repairText, tidyItemName, TYPES } };
 })();

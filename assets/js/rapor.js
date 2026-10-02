@@ -158,8 +158,9 @@
 
     // ---- 4. Kalem listesi
     children.push(H1(++n, "Kalem Listesi"));
-    const items = (s.items && s.items.length) ? s.items.map((i) => [i.no, i.name, qty(i.qty), i.unit])
-      : (ai.ana_kalemler || []).filter((i) => useful(i.ad)).map((i, k) => [String(k + 1), i.ad, i.miktar, i.birim]);
+    const tidyName = (window.TR_PROJE && window.TR_PROJE.core.tidyItemName) || ((x) => x);
+    const items = (s.items && s.items.length) ? s.items.map((i) => [i.no, tidyName(i.name), qty(i.qty), i.unit])
+      : (ai.ana_kalemler || []).filter((i) => useful(i.ad)).map((i, k) => [String(k + 1), tidyName(i.ad), i.miktar, i.birim]);
     if (items.length) {
       const W = [800, CONTENT_W - 800 - 1500 - 1400, 1500, 1400];
       children.push(text(`Toplam ${items.length} kalem.`, { size: 18, color: C.grey, after: 80 }));

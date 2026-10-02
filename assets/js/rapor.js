@@ -202,19 +202,6 @@
     const eksik = [...(ai.eksik_veya_belirsiz || []).map(tidy).filter(useful), ...(missingTypes.length ? [`İncelenmeyen doküman: ${missingTypes.join(", ")}.`] : [])];
     if (eksik.length) { children.push(H1(++n, "Eksik veya Belirsiz Bilgiler")); children.push(...bullets(eksik)); }
 
-    // ---- 10. Değerlendirme ve karar
-    children.push(H1(++n, "Değerlendirme ve Karar"));
-    children.push(para([run("Teklif kararı:     ", { bold: true, color: C.ink }), run("☐  Teklif verilecek          ☐  Teklif verilmeyecek          ☐  Ek inceleme gerekli", { size: 21 })], { after: 180 }));
-    if (watch && watch.note) { children.push(H2("Notlar")); watch.note.split(/\r?\n/).filter(Boolean).forEach((l) => children.push(text(l, { size: 20 }))); }
-    children.push(H2("Değerlendirme"));
-    const blank = { top: NONE, left: NONE, right: NONE, bottom: B(C.line) };
-    children.push(table([CONTENT_W], Array.from({ length: 4 }, () => new TableRow({ cantSplit: true, height: { value: 460, rule: "atLeast" }, children: [cell(run(" "), CONTENT_W, { borders: blank })] }))));
-    children.push(text("", { after: 260 }));
-    const sign = (label, name, date) => cell([para(run(label, { size: 17, color: C.grey, caps: true, spacing: 10 }), { after: 40 }), para(run(name || " ", { bold: true, color: C.ink }), { after: 30 }),
-      para(run(date || "Tarih:", { size: 18, color: C.grey }), { after: 420 }), para(run("İmza", { size: 17, color: C.grey }), { after: 0 })],
-      CONTENT_W / 2, { valign: VerticalAlign.TOP, borders: { top: B(C.ink, 6), bottom: NONE, left: NONE, right: NONE } });
-    children.push(table([CONTENT_W / 2, CONTENT_W / 2], [new TableRow({ cantSplit: true, children: [sign("Hazırlayan", AUTHOR, fmtDate(now)), sign("Onaylayan", "", "")] })]));
-
     // ---- Ek: incelenen dokümanlar
     children.push(H1("", "Ek — İncelenen Dokümanlar"));
     const docs = rec.files || [];

@@ -417,3 +417,6 @@ body.gated .app { visibility: hidden; }
 .prov-switch { display: flex; gap: 6px; flex-wrap: wrap; }
 .ai-run { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
 .ai-run select { font-size: 12px; padding: 3px 6px; margin-left: 4px; }
+.report-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; padding: 14px 18px;
+  border-radius: 12px; background: var(--accent-soft); border: 1px solid var(--accent); }
+@media print { .report-bar { display: none !important; } }

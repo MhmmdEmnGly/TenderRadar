@@ -1941,7 +1941,7 @@
     projeScript.then(() => {
       if (!document.body.contains(root)) return;   // bu arada başka sayfaya geçildi
       window.TR_PROJE.mount(root, {
-        tender: t, cloud: CLOUD, keywords: state.keywords.pos, toast,
+        tender: t, cloud: CLOUD, keywords: state.keywords.pos, toast, watch: () => state.watch[t.id] || null,
         onSaved: (id, row) => { projeler[id] = { updatedAt: row.updated_at, files: (row.files || []).length, ai: !!row.ai }; }
       });
     }).catch((e) => { root.innerHTML = `<div class="card card-pad"><p>${esc(e.message)} — sayfayı yenile.</p></div>`; });
